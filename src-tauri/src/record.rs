@@ -157,26 +157,91 @@ fn merge_labeled_segments(mic: &[crate::groq::Segment], loopback: &[crate::groq:
     all.extend(loopback.iter().map(|s| (s.start_secs, Track::System, s.text.as_str())));
     all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut lines = Vec::with_capacity(all.len());
+    let mut lines: Vec<(Track, String)> = Vec::with_capacity(all.len());
     let mut last_track: Option<Track> = None;
     for (_, track, text) in all {
-        let label = match track {
-            Track::You => "You",
-            Track::System => "System audio",
-        };
         if last_track != Some(track) {
-            lines.push(format!("[{label}] {text}"));
+            lines.push((track, text.to_string()));
         } else {
             // Same speaker/track as the line above — merge into it instead
             // of repeating the label for every short segment.
             if let Some(last) = lines.last_mut() {
-                last.push(' ');
-                last.push_str(text);
+                last.1.push(' ');
+                last.1.push_str(text);
             }
         }
         last_track = Some(track);
     }
-    lines.join("\n")
+    lines
+        .into_iter()
+        .map(|(track, text)| {
+            let label = match track {
+                Track::You => "You",
+                Track::System => "System audio",
+            };
+            format!("[{label}] {}", collapse_repeats(&text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whisper sometimes loops, repeating a clause or a whole passage back to
+/// back. Drop any run of clauses (4+ words in total) that exactly repeats
+/// the run right before it; short real repeats ("yes, yes") are kept.
+fn collapse_repeats(text: &str) -> String {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if matches!(c, '.' | ',' | '!' | '?' | ';') {
+            let end = i + c.len_utf8();
+            clauses.push(&text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        clauses.push(&text[start..]);
+    }
+    let norm: Vec<String> = clauses.iter().map(|c| normalize(c)).collect();
+
+    let mut kept: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < clauses.len() {
+        let mut skipped = false;
+        // Longest repeated run first, so whole repeated passages go at once.
+        for len in (1..=kept.len().min(clauses.len() - i)).rev() {
+            let prev = &kept[kept.len() - len..];
+            let words: usize = prev
+                .iter()
+                .map(|&k| norm[k].split(' ').filter(|w| !w.is_empty()).count())
+                .sum();
+            if words >= 4 && (0..len).all(|j| norm[prev[j]] == norm[i + j]) {
+                i += len;
+                skipped = true;
+                break;
+            }
+        }
+        if !skipped {
+            kept.push(i);
+            i += 1;
+        }
+    }
+    kept
+        .iter()
+        .map(|&k| clauses[k])
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Case- and punctuation-insensitive clause form used to compare repeats.
+fn normalize(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -221,5 +286,39 @@ mod tests {
         let loopback = vec![seg(5.0, "Reply.")];
         let merged = merge_labeled_segments(&mic, &loopback);
         assert_eq!(merged, "[You] One. Two. Three.\n[System audio] Reply.");
+    }
+
+    /// Whisper occasionally loops the same clause (or a whole passage) back
+    /// to back; those repeats are collapsed, while short real repeats and
+    /// ordinary speech survive untouched.
+    #[test]
+    fn whisper_loops_are_collapsed() {
+        assert_eq!(
+            collapse_repeats(
+                "The food was being served in the city, the food was being served in the city, the food was being served in the city,"
+            ),
+            "The food was being served in the city,"
+        );
+        assert_eq!(
+            collapse_repeats(
+                "Hello, this is a test. How can I help you? Hello, this is a test. How can I help you?"
+            ),
+            "Hello, this is a test. How can I help you?"
+        );
+        assert_eq!(collapse_repeats("Yes, yes, that's right."), "Yes, yes, that's right.");
+        assert_eq!(collapse_repeats("No repeats here at all."), "No repeats here at all.");
+    }
+
+    #[test]
+    fn collapsed_loops_in_merged_transcript() {
+        let mic = vec![
+            seg(0.0, "The food was being served in the city,"),
+            seg(4.0, "the food was being served in the city,"),
+        ];
+        let loopback = vec![seg(8.0, "Yes.")];
+        assert_eq!(
+            merge_labeled_segments(&mic, &loopback),
+            "[You] The food was being served in the city,\n[System audio] Yes."
+        );
     }
 }
