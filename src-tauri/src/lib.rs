@@ -431,7 +431,8 @@ const CLI_DICTATION_ID: u32 = 0xFFFF_FF00;
 /// `--dictate` toggles: run once to start, again to stop and insert.
 /// Returns true if an action flag was found.
 fn run_cli_action(app: &AppHandle<Wry>, args: &[String]) -> bool {
-    let Some(flag) = args.iter().skip(1).find(|a| a.starts_with("--")) else {
+    let Some((flag_idx, flag)) = args.iter().enumerate().skip(1).find(|(_, a)| a.starts_with("--"))
+    else {
         return false;
     };
     match flag.as_str() {
@@ -450,6 +451,13 @@ fn run_cli_action(app: &AppHandle<Wry>, args: &[String]) -> bool {
         }
         "--wheel" => on_wheel_open(app),
         "--speak" => on_speak_toggle(app),
+        "--speak-text" => {
+            // Everything after the flag is the text to speak, so callers can
+            // pass unquoted multi-word text; a later flag would be swallowed
+            // too, which is fine for the bridge-plugin use case (text last).
+            let text = args[flag_idx + 1..].join(" ");
+            on_speak_text(app, &text);
+        }
         "--web" => on_web_toggle(app),
         "--record" => {
             let _ = wheel_record_toggle(app.clone());
@@ -623,6 +631,36 @@ fn on_speak_toggle(app: &AppHandle<Wry>) {
         drop(state);
         if let Err(e) = speak::speak(&app, &speaker, &text) {
             usage::record_err(&app, usage::Purpose::SpeakAloud, &format!("speak: {e}"));
+            events::emit(&app, Status::Error, Some(e.to_string()));
+            return;
+        }
+        events::emit(&app, Status::Idle, None);
+    });
+}
+
+/// `--speak-text "<text>"`: synthesize and play `text` aloud through the same
+/// Kokoro pipeline as speak-selected-text, but with the text supplied by the
+/// caller instead of a clipboard selection — the programmatic entry point for
+/// external tools (e.g. a ZCode plugin bridge reading chat replies aloud).
+/// Runs off the main thread like `on_speak_toggle`, because both the
+/// single-instance callback and the startup arg pass invoke this there, and
+/// synthesis blocks for seconds. A new call replaces any current playback
+/// (the speaker's sink is replaced on the first synthesized chunk).
+fn on_speak_text(app: &AppHandle<Wry>, text: &str) {
+    if text.trim().is_empty() {
+        eprintln!("speak-text: no text given");
+        return;
+    }
+    let app = app.clone();
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        events::emit(&app, Status::Speaking, Some("speaking text…".into()));
+        let state: State<AppState> = app.state();
+        let speaker = state.speaker.clone();
+        drop(state);
+        if let Err(e) = speak::speak(&app, &speaker, &text) {
+            eprintln!("speak-text: {e}");
+            usage::record_err(&app, usage::Purpose::SpeakAloud, &format!("speak-text: {e}"));
             events::emit(&app, Status::Error, Some(e.to_string()));
             return;
         }
