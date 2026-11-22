@@ -573,12 +573,23 @@ fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
         .map(|t| 0.5 - 0.5 * (std::f32::consts::TAU * t as f32 / W as f32).cos())
         .collect();
     let ha = (((HS as f32) / alpha).round() as usize).max(1); // analysis hop
-    // Pad the input with silence so every frame — including the last ones
-    // with their ±DELTA slide — can always read a full window.
-    let mut x = samples.to_vec();
-    x.extend(std::iter::repeat(0.0).take(W + DELTA as usize));
-    let padded = x.len();
     let n_frames = (target - W) / HS + 1; // exact: frames tile `target` fully
+    // Pad the input only by the true shortfall of the last frames, and do it
+    // by MIRRORING the waveform's tail: the frames covering a chunk's final
+    // word then read real signal instead of silence, which used to fade/click
+    // the end of every chunk (zero padding = abrupt energy drop).
+    let nat_max = (n_frames - 1) * ha;
+    let pad = (nat_max + DELTA as usize + W).saturating_sub(samples.len()) + 2;
+    let mut x = samples.to_vec();
+    if pad > 0 {
+        let take = pad.min(x.len());
+        let tail: Vec<f32> = x.iter().rev().take(take).copied().collect();
+        x.extend(tail);
+        while x.len() < samples.len() + pad {
+            x.push(*x.last().unwrap_or(&0.0));
+        }
+    }
+    let padded = x.len();
     let mut out = vec![0.0f32; target];
     let mut prev_start: usize = 0; // actual chosen input start of last frame
     for f in 0..n_frames {
