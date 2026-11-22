@@ -94,6 +94,13 @@ pub struct AppState {
     shortcut_wheel: Mutex<Option<Shortcut>>,
     /// The "toggle Web browser window" shortcut (default Alt+W).
     shortcut_web: Mutex<Option<Shortcut>>,
+    /// The "rewrite selection professionally" shortcut (default Alt+P).
+    shortcut_professional: Mutex<Option<Shortcut>>,
+    /// The "rewrite selection naturally" shortcut (default Alt+H).
+    shortcut_humanize: Mutex<Option<Shortcut>>,
+    /// Set while a rewrite (professional/humanize) is running, so a second
+    /// hotkey press during one doesn't stack capture/replace passes.
+    refining: AtomicBool,
     shortcut_update: Mutex<()>,
     /// Owns current TTS playback so a second hotkey press can stop it.
     speaker: Arc<speak::Speaker>,
@@ -122,6 +129,9 @@ impl AppState {
             shortcut_speak: Mutex::new(None),
             shortcut_wheel: Mutex::new(None),
             shortcut_web: Mutex::new(None),
+            shortcut_professional: Mutex::new(None),
+            shortcut_humanize: Mutex::new(None),
+            refining: AtomicBool::new(false),
             shortcut_update: Mutex::new(()),
             speaker: Arc::new(speak::Speaker::new()),
             wheel_text: Mutex::new(String::new()),
@@ -213,11 +223,7 @@ fn apply_speak_shortcut(app: &AppHandle<Wry>, spec: &str) -> bool {
         return true;
     }
     if let Some(sc) = next {
-        let clashes = state.shortcut_primary.lock().as_ref() == Some(&sc)
-            || state.shortcut_secondary.lock().as_ref() == Some(&sc)
-            || state.shortcut_wheel.lock().as_ref() == Some(&sc)
-            || state.shortcut_web.lock().as_ref() == Some(&sc);
-        if clashes || gs.register(sc).is_err() {
+        if shortcut_taken(&state, &sc, slot) || gs.register(sc).is_err() {
             return false;
         }
     }
@@ -262,11 +268,7 @@ fn apply_wheel_shortcut(app: &AppHandle<Wry>, spec: &str) -> bool {
         return true;
     }
     if let Some(sc) = next {
-        let clashes = state.shortcut_primary.lock().as_ref() == Some(&sc)
-            || state.shortcut_secondary.lock().as_ref() == Some(&sc)
-            || state.shortcut_speak.lock().as_ref() == Some(&sc)
-            || state.shortcut_web.lock().as_ref() == Some(&sc);
-        if clashes || gs.register(sc).is_err() {
+        if shortcut_taken(&state, &sc, slot) || gs.register(sc).is_err() {
             return false;
         }
     }
@@ -311,11 +313,7 @@ fn apply_web_shortcut(app: &AppHandle<Wry>, spec: &str) -> bool {
         return true;
     }
     if let Some(sc) = next {
-        let clashes = state.shortcut_primary.lock().as_ref() == Some(&sc)
-            || state.shortcut_secondary.lock().as_ref() == Some(&sc)
-            || state.shortcut_speak.lock().as_ref() == Some(&sc)
-            || state.shortcut_wheel.lock().as_ref() == Some(&sc);
-        if clashes || gs.register(sc).is_err() {
+        if shortcut_taken(&state, &sc, slot) || gs.register(sc).is_err() {
             return false;
         }
     }
@@ -336,6 +334,91 @@ fn is_web_shortcut(app: &AppHandle<Wry>, fired: &Shortcut) -> bool {
     let state: State<AppState> = app.state();
     let matches = state.shortcut_web.lock().as_ref().map(|s| s == fired).unwrap_or(false);
     matches
+}
+
+/// True if `sc` is already taken by any registered shortcut slot other than
+/// `own` — every slot's clash check funnels through here so a new slot can
+/// never be forgotten from another slot's list.
+fn shortcut_taken(state: &State<AppState>, sc: &Shortcut, own: &Mutex<Option<Shortcut>>) -> bool {
+    let slots = [
+        &state.shortcut_primary,
+        &state.shortcut_secondary,
+        &state.shortcut_speak,
+        &state.shortcut_wheel,
+        &state.shortcut_web,
+        &state.shortcut_professional,
+        &state.shortcut_humanize,
+    ];
+    slots
+        .iter()
+        .any(|s| !std::ptr::eq(*s, own) && s.lock().as_ref() == Some(sc))
+}
+
+/// Register (or clear) the "rewrite selection professionally" shortcut
+/// (Alt+P). Mirrors `apply_web_shortcut` — independent of dictation.
+fn apply_professional_shortcut(app: &AppHandle<Wry>, spec: &str) -> bool {
+    let state: State<AppState> = app.state();
+    let slot = &state.shortcut_professional;
+    apply_rewrite_shortcut(app, spec, slot)
+}
+
+/// Register (or clear) the "rewrite selection naturally" shortcut (Alt+H).
+fn apply_humanize_shortcut(app: &AppHandle<Wry>, spec: &str) -> bool {
+    let state: State<AppState> = app.state();
+    let slot = &state.shortcut_humanize;
+    apply_rewrite_shortcut(app, spec, slot)
+}
+
+fn apply_rewrite_shortcut(
+    app: &AppHandle<Wry>,
+    spec: &str,
+    slot: &Mutex<Option<Shortcut>>,
+) -> bool {
+    let gs = app.global_shortcut();
+    let state: State<AppState> = app.state();
+    let _update = state.shortcut_update.lock();
+
+    let current = *slot.lock();
+    let next = if spec.trim().is_empty() {
+        None
+    } else {
+        let Ok(sc) = spec.parse::<Shortcut>() else {
+            return false;
+        };
+        Some(sc)
+    };
+    if current == next {
+        return true;
+    }
+    if let Some(sc) = next {
+        if shortcut_taken(&state, &sc, slot) || gs.register(sc).is_err() {
+            return false;
+        }
+    }
+    if let Some(prev) = current {
+        if gs.unregister(prev).is_err() {
+            if let Some(sc) = next {
+                let _ = gs.unregister(sc);
+            }
+            return false;
+        }
+    }
+    *slot.lock() = next;
+    true
+}
+
+/// True if `fired` is one of the registered rewrite-mode shortcuts; returns
+/// the action it runs.
+fn rewrite_action_for(app: &AppHandle<Wry>, fired: &Shortcut) -> Option<refine::Action> {
+    let state: State<AppState> = app.state();
+    let hit = |slot: &Mutex<Option<Shortcut>>| slot.lock().as_ref().map(|s| s == fired).unwrap_or(false);
+    if hit(&state.shortcut_professional) {
+        Some(refine::Action::Professional)
+    } else if hit(&state.shortcut_humanize) {
+        Some(refine::Action::Humanize)
+    } else {
+        None
+    }
 }
 
 /// Map a fired shortcut back to its language slot.
@@ -384,6 +467,17 @@ fn on_shortcut(app: &AppHandle<Wry>, shortcut: &Shortcut, event: ShortcutState) 
             #[cfg(windows)]
             hotkey_guard::arm(shortcut);
             on_web_toggle(app);
+        }
+        return;
+    }
+    // The rewrite-mode hotkeys (Alt+P / Alt+H) replace the selected text in
+    // place — same key-down-edge shape as the Web toggle, no dictation state.
+    if let Some(action) = rewrite_action_for(app, shortcut) {
+        if event == ShortcutState::Pressed {
+            #[cfg(windows)]
+            hotkey_guard::arm(shortcut);
+            typer::prepare_hotkey();
+            on_rewrite_selection(app, action);
         }
         return;
     }
@@ -451,6 +545,8 @@ fn run_cli_action(app: &AppHandle<Wry>, args: &[String]) -> bool {
         }
         "--wheel" => on_wheel_open(app),
         "--speak" => on_speak_toggle(app),
+        "--professional" => on_rewrite_selection(app, refine::Action::Professional),
+        "--humanize" => on_rewrite_selection(app, refine::Action::Humanize),
         "--speak-text" => {
             // Everything after the flag is the text to speak, so callers can
             // pass unquoted multi-word text; a later flag would be swallowed
@@ -668,6 +764,67 @@ fn on_speak_text(app: &AppHandle<Wry>, text: &str) {
     });
 }
 
+/// Rewrite selection (Alt+P / Alt+H, or --professional / --humanize):
+/// capture the selected text, rewrite it via Groq in `action`'s style, and
+/// replace the selection in place. Only one rewrite runs at a time, whatever
+/// the mode. Runs off the main thread like `on_speak_toggle`.
+fn on_rewrite_selection(app: &AppHandle<Wry>, action: refine::Action) {
+    let state: State<AppState> = app.state();
+    if state.refining.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    drop(state);
+    // Where to paste back — captured before anything else can move focus.
+    let target = typer::Target::capture();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        events::emit(&app, Status::Transcribing, Some("rewriting…".into()));
+        let result = rewrite_selection(&app, target, action);
+        let state: State<AppState> = app.state();
+        state.refining.store(false, Ordering::SeqCst);
+        drop(state);
+        match result {
+            Ok(changed) => {
+                events::emit(&app, Status::Idle, None);
+                if !changed {
+                    eprintln!("rewrite: output matched the input — selection left as-is");
+                }
+            }
+            Err(e) => {
+                events::emit(&app, Status::Error, Some(e.to_string()));
+            }
+        }
+    });
+}
+
+/// Copy the selection, rewrite it via Groq in `action`'s style, and paste the
+/// result over it (typing over the still-selected text replaces it). Returns
+/// whether the text changed.
+fn rewrite_selection(
+    app: &AppHandle<Wry>,
+    target: typer::Target,
+    action: refine::Action,
+) -> anyhow::Result<bool> {
+    let cfg = settings::load(app);
+    let Some(key) = keychain::get(keychain::Purpose::Dictation) else {
+        anyhow::bail!("Groq API key required — set it in Settings to use the rewrite hotkeys");
+    };
+    let text = speak::capture_selection(app).map_err(|e| {
+        if e.to_string().contains("no text selected") {
+            anyhow::anyhow!("Select some text first, then try again")
+        } else {
+            e
+        }
+    })?;
+    let out = refine::run(&text, &key, action)?;
+    if out == text.trim() {
+        return Ok(false);
+    }
+    let mode = typer::InsertMode::parse(&cfg.insertion);
+    typer::insert(app, &out, mode, target)?;
+    Ok(true)
+}
+
 /// Alt+W: open the Web browser window pair, or hide it if already showing —
 /// same toggle shape as `on_speak_toggle`, just for a window instead of TTS
 /// playback. Runs off the shortcut-handling thread since window creation
@@ -781,6 +938,28 @@ fn set_web_hotkey(app: AppHandle<Wry>, hotkey: String) -> bool {
     }
     let mut cfg = settings::load(&app);
     cfg.web_hotkey = hotkey;
+    let _ = settings::save(&app, &cfg);
+    true
+}
+
+#[tauri::command]
+fn set_professional_hotkey(app: AppHandle<Wry>, hotkey: String) -> bool {
+    if !apply_professional_shortcut(&app, &hotkey) {
+        return false;
+    }
+    let mut cfg = settings::load(&app);
+    cfg.professional_hotkey = hotkey;
+    let _ = settings::save(&app, &cfg);
+    true
+}
+
+#[tauri::command]
+fn set_humanize_hotkey(app: AppHandle<Wry>, hotkey: String) -> bool {
+    if !apply_humanize_shortcut(&app, &hotkey) {
+        return false;
+    }
+    let mut cfg = settings::load(&app);
+    cfg.humanize_hotkey = hotkey;
     let _ = settings::save(&app, &cfg);
     true
 }
@@ -2072,6 +2251,8 @@ pub fn run() {
             set_speak_hotkey,
             set_wheel_hotkey,
             set_web_hotkey,
+            set_professional_hotkey,
+            set_humanize_hotkey,
             wheel_run,
             wheel_cancel,
             wheel_record_toggle,
@@ -2177,6 +2358,26 @@ pub fn run() {
                     &handle,
                     Status::Error,
                     Some(format!("could not register Web hotkey '{}'", cfg.web_hotkey)),
+                );
+            }
+            if !apply_professional_shortcut(&handle, &cfg.professional_hotkey) {
+                events::emit(
+                    &handle,
+                    Status::Error,
+                    Some(format!(
+                        "could not register professional-rewrite hotkey '{}'",
+                        cfg.professional_hotkey
+                    )),
+                );
+            }
+            if !apply_humanize_shortcut(&handle, &cfg.humanize_hotkey) {
+                events::emit(
+                    &handle,
+                    Status::Error,
+                    Some(format!(
+                        "could not register humanize-rewrite hotkey '{}'",
+                        cfg.humanize_hotkey
+                    )),
                 );
             }
 

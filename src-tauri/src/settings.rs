@@ -57,6 +57,12 @@ pub struct Settings {
     /// between two presets without new model files. Empty = no blend.
     /// Settings-file only for now (no UI); e.g. "af_bella".
     pub tts_blend_voice: String,
+    /// Hotkey that rewrites the selection as a polished, professional
+    /// message (see `refine::Action::Professional`). Empty = disabled.
+    pub professional_hotkey: String,
+    /// Hotkey that rewrites the selection to sound natural and human
+    /// (see `refine::Action::Humanize`). Empty = disabled.
+    pub humanize_hotkey: String,
     /// One-time consent for the "Find"/"AI" wedges' camera and screen
     /// capture, asked via a custom in-app dialog (see `ai_chat.rs`) rather
     /// than relying on Windows' own per-API prompts. Reset this to `false`
@@ -95,6 +101,8 @@ impl Default for Settings {
             tts_voice: String::new(),
             tts_speed: 1.0,
             tts_blend_voice: String::new(),
+            professional_hotkey: "Alt+P".to_string(),
+            humanize_hotkey: "Alt+H".to_string(),
             capture_permission_granted: false,
             vision_model: String::new(),
             web_default_url: String::new(),

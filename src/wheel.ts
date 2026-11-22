@@ -79,12 +79,19 @@ const ICON_WEB =
 const TOTAL_SLOTS = 6;
 
 const MAIN_WEDGES: WedgeDef[] = [
-  { action: "refine", label: "Refine", icon: ICON_REFINE },
+  { action: "__rewrite", label: "Refine", icon: ICON_REFINE },
   { action: "bangla", label: "Bangla", icon: ICON_BANGLA },
   { action: "__translate", label: "Translate", icon: ICON_GLOBE },
   { action: "__record", label: "Record", icon: ICON_RECORD },
   { action: "__web", label: "Web", icon: ICON_WEB },
   { action: "__ai", label: "AI", icon: ICON_AI },
+];
+
+// Second-level menu shown after clicking "Refine": pick a rewrite style.
+const REWRITE_WEDGES: WedgeDef[] = [
+  { action: "refine", label: "Refine", icon: ICON_REFINE },
+  { action: "professional", label: "Professional", icon: ICON_REFINE },
+  { action: "humanize", label: "Humanize", icon: ICON_REFINE },
 ];
 
 // Second-level menu shown after clicking "Translate": pick a target language.
@@ -209,6 +216,12 @@ function buildWheel(wedges: WedgeDef[]) {
 }
 
 function onWedgeClick(action: string) {
+  if (action === "__rewrite") {
+    // Same submenu pattern as Translate: swap the ring to the rewrite-style
+    // picker (Escape steps back to the main menu).
+    buildWheel(REWRITE_WEDGES);
+    return;
+  }
   if (action === "__translate") {
     buildWheel(LANGUAGE_WEDGES);
     return;
