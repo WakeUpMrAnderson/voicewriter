@@ -37,6 +37,7 @@
 //! clamped to the table's last row for longer inputs.
 
 use anyhow::{anyhow, Context, Result};
+use misaki_rs::{G2P, Language};
 use ndarray::{Array1, Array2};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -95,9 +96,51 @@ fn tokenize(phonemes: &str) -> Vec<i64> {
     phonemes.chars().filter_map(|c| v.get(&c).copied()).collect()
 }
 
+/// Phonemize one clause: misaki (Kokoro's training G2P) first, bundled
+/// eSpeak NG for clauses with words misaki leaves unresolved.
+fn phonemize_clause(app: &AppHandle<Wry>, clause: &str, voice: &str) -> Result<String> {
+    let lang = if voice.starts_with('b') { Language::EnglishGB } else { Language::EnglishUS };
+    if let Some(ph) = misaki_phonemize(clause, lang) {
+        if !ph.contains(MISAKI_UNRESOLVED) {
+            return Ok(ph);
+        }
+        eprintln!("kokoro: clause has unresolved words, falling back to espeak-ng");
+    }
+    phonemize_clause_espeak(app, clause, voice)
+}
+
+/// Kokoro's own G2P engine (misaki), in-process: this is the phonemizer the
+/// model was actually trained on, so its output — POS-aware stress, expanded
+/// numbers, Kokoro-vocabulary phonemes — reads far more naturally than the
+/// espeak IPA path it replaces. Pure Rust, no runtime resource files, no
+/// subprocess. The crate's `espeak` fallback feature is disabled (it builds
+/// espeak-ng from source via cmake); clauses misaki can't fully resolve fall
+/// back to our bundled espeak-ng below instead.
+static MISAKI: std::sync::OnceLock<Option<Mutex<G2P>>> = std::sync::OnceLock::new();
+
+const MISAKI_UNRESOLVED: char = '❓';
+
+fn misaki_phonemize(clause: &str, lang: Language) -> Option<String> {
+    let cell = MISAKI.get_or_init(|| {
+        match G2P::new(lang) {
+            g => Some(Mutex::new(g)),
+        }
+    });
+    let g = cell.as_ref()?.lock().ok()?;
+    match g.g2p(clause) {
+        Ok((ph, _tokens)) => Some(ph),
+        Err(e) => {
+            eprintln!("kokoro: misaki g2p failed: {e}");
+            None
+        }
+    }
+}
+
 /// Run eSpeak NG as a phonemizer (`--ipa`, no audio output) on one clause of
 /// text, reusing the same bundled binary + `--path`/cwd setup as `espeak.rs`.
-fn phonemize_clause(app: &AppHandle<Wry>, clause: &str, voice: &str) -> Result<String> {
+/// Fallback path — misaki handles ordinary English; espeak covers clauses
+/// with words misaki's lexicon doesn't resolve.
+fn phonemize_clause_espeak(app: &AppHandle<Wry>, clause: &str, voice: &str) -> Result<String> {
     if let Some(ipa) = crate::espeak::ipa(app, clause, voice) {
         return Ok(normalize_phonemes(ipa.trim()));
     }
@@ -199,6 +242,15 @@ impl VoiceTable {
     }
 }
 
+/// 50/50 average of two voices' style vectors — produces a voice "between"
+/// the two presets without any new model files (voice blending, as pykokoro
+/// and the Kokoro web demo do).
+fn blend_styles(style: &mut [f32], other: &[f32]) {
+    for (s, o) in style.iter_mut().zip(other) {
+        *s = (*s + o) / 2.0;
+    }
+}
+
 fn load_voices(path: &std::path::Path) -> Result<HashMap<String, VoiceTable>> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut npz = ndarray_npy::NpzReader::new(file).context("read voices npz")?;
@@ -290,14 +342,20 @@ impl Kokoro {
     }
 
     /// Synthesize `text` with `voice` (a `VOICES` id) at `speed` (1.0 =
-    /// normal), returning 24 kHz mono f32 PCM samples.
-    fn synthesize(&self, tokens: &[i64], voice: &str, speed: f32) -> Result<Vec<f32>> {
+    /// normal), optionally blended 50/50 with `blend_voice` (empty = no
+    /// blend), returning 24 kHz mono f32 PCM samples.
+    fn synthesize(&self, tokens: &[i64], voice: &str, blend_voice: &str, speed: f32) -> Result<Vec<f32>> {
         let table = self
             .voices
             .get(voice)
             .or_else(|| self.voices.get(DEFAULT_VOICE))
             .ok_or_else(|| anyhow!("voice '{voice}' not found in voices pack"))?;
-        let style = table.style_for(tokens.len());
+        let mut style = table.style_for(tokens.len());
+        if !blend_voice.is_empty() {
+            if let Some(blend) = self.voices.get(blend_voice) {
+                blend_styles(&mut style, &blend.style_for(tokens.len()));
+            }
+        }
 
         let mut padded = Vec::with_capacity(tokens.len() + 2);
         padded.push(0i64);
@@ -359,7 +417,7 @@ pub fn preload(app: AppHandle<Wry>) {
             Ok(k) => {
                 // A short warm-up run primes ONNX Runtime's kernels too.
                 let _ = phonemize(&app, "Ready.", DEFAULT_VOICE)
-                    .map(|ph| k.synthesize(&tokenize(&ph), DEFAULT_VOICE, 1.0));
+                    .map(|ph| k.synthesize(&tokenize(&ph), DEFAULT_VOICE, "", 1.0));
                 eprintln!("kokoro: preloaded in {:?}", t0.elapsed());
             }
             Err(e) => eprintln!("kokoro: preload failed: {e}"),
@@ -378,11 +436,11 @@ pub fn unload() {
 }
 
 /// Synthesize `text` aloud and return 16-bit PCM WAV bytes at 24 kHz mono.
-/// `voice` empty = `DEFAULT_VOICE`. English/Latin-script text only — see
+/// `voice` empty = `DEFAULT_VOICE`; `blend_voice` empty = no blend. See
 /// `needs_unsupported_language` for the check callers should make first.
-pub fn speak(app: &AppHandle<Wry>, text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
+pub fn speak(app: &AppHandle<Wry>, text: &str, voice: &str, blend_voice: &str, speed: f32) -> Result<Vec<u8>> {
     let mut samples = Vec::new();
-    speak_chunks(app, text, voice, speed, |chunk| {
+    speak_chunks(app, text, voice, blend_voice, speed, |chunk| {
         samples.extend(chunk);
         Ok(true)
     })?;
@@ -397,6 +455,7 @@ pub fn speak_chunks(
     app: &AppHandle<Wry>,
     text: &str,
     voice: &str,
+    blend_voice: &str,
     speed: f32,
     mut on_chunk: impl FnMut(Vec<f32>) -> Result<bool>,
 ) -> Result<()> {
@@ -406,19 +465,29 @@ pub fn speak_chunks(
     }
     let voice = if voice.is_empty() { DEFAULT_VOICE } else { voice };
     let eng = engine(app)?;
+    let chunks = split_for_length(trimmed, 40, 200);
 
     // Short chunks keep time-to-first-audio low; each also stays well under
     // Kokoro's ~510-token input ceiling.
     let mut produced = false;
-    for chunk_text in split_for_length(trimmed, 40, 200) {
+    for (idx, chunk_text) in chunks.iter().enumerate() {
+        let chunk_text = chunk_text.as_str();
         let t0 = std::time::Instant::now();
-        let ph = phonemize(app, &chunk_text, voice)?;
+        let ph = phonemize(app, chunk_text, voice)?;
         let t_ph = t0.elapsed();
         let toks = tokenize(&ph);
         if toks.is_empty() {
             continue;
         }
-        let samples = eng.synthesize(&toks, voice, speed)?;
+        // A little deterministic per-chunk speed jitter (±2%) breaks the
+        // metronome feel of long reads; hash-derived so the same text always
+        // sounds the same. Only worth it when there IS more than one chunk.
+        let chunk_speed = if chunks.len() > 1 {
+            speed * chunk_jitter(idx, chunk_text)
+        } else {
+            speed
+        };
+        let samples = eng.synthesize(&toks, voice, blend_voice, chunk_speed)?;
         eprintln!(
             "kokoro: chunk {} chars / {} tokens: phonemize {t_ph:?}, synth {:?}, audio {:.1}s",
             chunk_text.len(),
@@ -438,6 +507,17 @@ pub fn speak_chunks(
         return Err(anyhow!("couldn't phonemize this text"));
     }
     Ok(())
+}
+
+/// Deterministic per-chunk speed multiplier in [0.98, 1.02]: integer-hash
+/// scatter, so identical text always produces identical speech without RNG
+/// state, and every chunk stays within a natural-sounding range.
+fn chunk_jitter(idx: usize, chunk_text: &str) -> f32 {
+    let h = idx
+        .wrapping_mul(2654435761)
+        ^ (chunk_text.len().wrapping_mul(0x9E37_79B9));
+    let spread = (h % 41) as f32 / 1000.0; // 0.000..=0.040
+    1.0 + spread - 0.02
 }
 
 /// Split text into chunks for streamed synthesis: the first chunk is cut at
@@ -522,9 +602,9 @@ mod tests {
                 let t = std::time::Instant::now();
                 let k = Kokoro::load_from(&model, &voices, threads).unwrap();
                 let load = t.elapsed();
-                k.synthesize(&toks, DEFAULT_VOICE, 1.0).unwrap(); // warm-up
+                k.synthesize(&toks, DEFAULT_VOICE, "", 1.0).unwrap(); // warm-up
                 let t = std::time::Instant::now();
-                let n = k.synthesize(&toks, DEFAULT_VOICE, 1.0).unwrap().len();
+                let n = k.synthesize(&toks, DEFAULT_VOICE, "", 1.0).unwrap().len();
                 let secs = n as f64 / SAMPLE_RATE as f64;
                 println!(
                     "{file} threads={threads}: load {load:?}, {:?} for {secs:.1}s audio (x{:.2} real time)",
@@ -597,6 +677,46 @@ mod tests {
         assert_eq!(table.style_for(1), vec![3.0, 4.0]);
         // token_len beyond the table clamps to the last row rather than panicking.
         assert_eq!(table.style_for(100), vec![3.0, 4.0]);
+    }
+
+    /// misaki is now the primary G2P: ordinary English must phonemize with
+    /// no unresolved markers, and the output must land inside Kokoro's
+    /// vocabulary (tokenize drops unknown chars — an empty token stream
+    /// would mean misaki's phonemes don't fit the vocab at all).
+    #[test]
+    fn misaki_phonemizes_into_kokoro_vocab() {
+        for text in [
+            "Hello there, this is a test.",
+            "I read 42 books in 2024, and paid $100 for them.",
+            "The record store let me record a demo.",
+        ] {
+            let ph = misaki_phonemize(text, Language::EnglishUS)
+                .unwrap_or_else(|| panic!("misaki failed on {text:?}"));
+            assert!(!ph.contains(MISAKI_UNRESOLVED), "unresolved words in {text:?}: {ph}");
+            let toks = tokenize(&ph);
+            assert!(!toks.is_empty(), "no vocab tokens from {text:?}: {ph}");
+        }
+    }
+
+    #[test]
+    fn chunk_jitter_stays_bounded_and_deterministic() {
+        for idx in 0..20usize {
+            for len in [0, 7, 41, 200] {
+                let j = chunk_jitter(idx, &"a".repeat(len));
+                assert!((0.98..=1.02).contains(&j), "jitter out of range: {j}");
+                // Deterministic: same inputs, same jitter.
+                assert_eq!(j, chunk_jitter(idx, &"a".repeat(len)));
+            }
+        }
+        // Different chunks (mostly) scatter differently.
+        assert_ne!(chunk_jitter(0, "abc"), chunk_jitter(1, "abcd"));
+    }
+
+    #[test]
+    fn blend_styles_averages() {
+        let mut a = vec![1.0, 3.0];
+        blend_styles(&mut a, &[2.0, 5.0]);
+        assert_eq!(a, vec![1.5, 4.0]);
     }
 
     #[test]

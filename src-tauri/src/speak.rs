@@ -11,6 +11,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam fade ramps the chunk head from the previous tail to itself.
+    #[test]
+    fn crossfade_blends_seam() {
+        const N: usize = 480;
+        let mut fader = Crossfader::new();
+        let mut first = vec![1.0f32; N * 2];
+        fader.apply(&mut first);
+        // First chunk untouched.
+        assert!(first[..N].iter().all(|&s| s == 1.0));
+        let mut second = vec![0.0f32; N * 2];
+        fader.apply(&mut second);
+        // Head fades from 1.0 (previous tail) to ~0.0 (new content): the
+        // ramp is linear over the whole seam, so index N-1 is one step shy.
+        assert!((second[0] - 1.0).abs() < 1e-6);
+        assert!(second[N - 1].abs() < 0.01);
+        let mid = second[N / 2];
+        assert!((mid - 0.5).abs() < 0.01, "midpoint {mid} not ~0.5");
+        // Past the seam, new content is untouched.
+        assert!(second[N..].iter().all(|&s| s == 0.0));
+        // And the stored tail tracks the (faded) chunk end.
+        assert!(fader.tail.iter().all(|&s| s == 0.0));
+    }
+}
+
 /// One in-progress or just-finished playback: the audio backend handles, a
 /// generation id (see `wait_until_done`), and the clip's total duration when
 /// the decoder could determine it (a streamed WAV's unknown-length RIFF
@@ -188,6 +216,36 @@ pub fn capture_selection(app: &tauri::AppHandle) -> Result<String> {
     Ok(copied)
 }
 
+/// Fades the head of each streamed chunk into the tail of the previous one
+/// (20 ms linear at 24 kHz), removing the small level jump — and with it the
+/// audible click — at the seam between separately-synthesized sentences.
+pub(crate) struct Crossfader {
+    tail: Vec<f32>,
+}
+
+impl Crossfader {
+    const SEAM: usize = 480; // 20 ms at 24 kHz
+
+    pub fn new() -> Self {
+        Self { tail: Vec::new() }
+    }
+
+    pub fn apply(&mut self, chunk: &mut [f32]) {
+        let n = Self::SEAM;
+        if self.tail.len() == n && chunk.len() >= n {
+            for (i, c) in chunk[..n].iter_mut().enumerate() {
+                let t = i as f32 / n as f32;
+                *c = self.tail[i] * (1.0 - t) + *c * t;
+            }
+        }
+        if chunk.len() >= n {
+            self.tail = chunk[chunk.len() - n..].to_vec();
+        } else {
+            self.tail.clear();
+        }
+    }
+}
+
 /// Synthesize `text` locally with Kokoro and play it aloud. Blocks until
 /// playback finishes naturally or is stopped via `Speaker::stop`. Kokoro is
 /// English/Latin-script only — non-Latin text (e.g. Bangla) is rejected with
@@ -213,14 +271,19 @@ pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &st
     let t0 = std::time::Instant::now();
     let cfg = crate::settings::load(app);
     let mut gen: Option<u64> = None;
-    crate::kokoro::speak_chunks(app, text, &cfg.tts_voice, cfg.tts_speed, |samples| match gen {
-        None => {
-            gen = Some(speaker.play_samples(samples)?);
-            eprintln!("speak: first audio after {:?}", t0.elapsed());
-            crate::events::emit(app, crate::events::Status::Speaking, Some("playing…".into()));
-            Ok(true)
+    let mut fader = Crossfader::new();
+    crate::kokoro::speak_chunks(app, text, &cfg.tts_voice, &cfg.tts_blend_voice, cfg.tts_speed, |samples| {
+        let mut samples = samples;
+        fader.apply(&mut samples);
+        match gen {
+            None => {
+                gen = Some(speaker.play_samples(samples)?);
+                eprintln!("speak: first audio after {:?}", t0.elapsed());
+                crate::events::emit(app, crate::events::Status::Speaking, Some("playing…".into()));
+                Ok(true)
+            }
+            Some(g) => Ok(speaker.append(g, samples)),
         }
-        Some(g) => Ok(speaker.append(g, samples)),
     })?;
     if let Some(g) = gen {
         speaker.wait_until_done(g, |_| {});

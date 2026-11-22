@@ -52,6 +52,11 @@ pub struct Settings {
     pub tts_voice: String,
     /// Kokoro speech rate multiplier. 1.0 = normal.
     pub tts_speed: f32,
+    /// Optional second Kokoro voice id blended into `tts_voice` (50/50
+    /// average of the two style vectors) — a cheap way to get a voice
+    /// between two presets without new model files. Empty = no blend.
+    /// Settings-file only for now (no UI); e.g. "af_bella".
+    pub tts_blend_voice: String,
     /// One-time consent for the "Find"/"AI" wedges' camera and screen
     /// capture, asked via a custom in-app dialog (see `ai_chat.rs`) rather
     /// than relying on Windows' own per-API prompts. Reset this to `false`
@@ -89,6 +94,7 @@ impl Default for Settings {
             hide_tray: false,
             tts_voice: String::new(),
             tts_speed: 1.0,
+            tts_blend_voice: String::new(),
             capture_permission_granted: false,
             vision_model: String::new(),
             web_default_url: String::new(),
