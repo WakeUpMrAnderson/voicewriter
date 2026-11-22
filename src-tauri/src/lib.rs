@@ -15,6 +15,7 @@ mod events;
 mod format;
 mod groq;
 mod kokoro;
+mod phonon;
 #[cfg(windows)]
 mod hotkey_guard;
 mod keychain;

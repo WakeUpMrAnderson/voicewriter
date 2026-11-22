@@ -63,7 +63,49 @@ const MODELS: &[Known] = &[
             },
         ],
     },
+    Known {
+        id: "phonon-31m-en",
+        kind: Kind::Tts,
+        label: "Phonon 31M (English)",
+        files: &[
+            KnownFile {
+                part: "config",
+                url: "https://huggingface.co/gradium/phonon-31m-en/resolve/main/config.json",
+                file_name: "phonon-31m-config.json",
+                approx_bytes: 5_000,
+            },
+            KnownFile {
+                part: "model",
+                url: "https://huggingface.co/gradium/phonon-31m-en/resolve/main/model.q8.gguf",
+                file_name: "phonon-31m-model.q8.gguf",
+                approx_bytes: 64_500_000,
+            },
+            KnownFile {
+                part: "voice",
+                url: "https://huggingface.co/gradium/phonon-31m-en/resolve/main/default-voice.safetensors",
+                file_name: "phonon-31m-voice.safetensors",
+                approx_bytes: 262_000,
+            },
+            KnownFile {
+                part: "tokenizer",
+                url: "https://huggingface.co/gradium/phonon-31m-en/resolve/main/tokenizer.json",
+                file_name: "phonon-31m-tokenizer.json",
+                approx_bytes: 278_000,
+            },
+        ],
+    },
 ];
+
+/// Paths to Phonon's four files — (config, weights, voice, tokenizer), in
+/// that order — used by `phonon.rs` to build its Synth.
+pub fn phonon_paths(app: &AppHandle<Wry>) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    Ok((
+        file_path(app, "phonon-31m-en", "config")?,
+        file_path(app, "phonon-31m-en", "model")?,
+        file_path(app, "phonon-31m-en", "voice")?,
+        file_path(app, "phonon-31m-en", "tokenizer")?,
+    ))
+}
 
 fn lookup(model: &str) -> Result<&'static Known> {
     MODELS

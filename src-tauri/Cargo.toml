@@ -60,6 +60,11 @@ enigo = { version = "0.6", features = ["serde"] }
 # route unresolved words through our bundled espeak-ng instead (kokoro.rs).
 misaki-rs = { version = "0.11", default-features = false }
 
+# The Phonon TTS engine (Gradium Phonon 31M) — second engine behind the
+# tts_engine setting; model files come from model.rs (Settings → Voice
+# Models), so the hf/hub download features stay off.
+ptts = { version = "0.7", features = ["hf"] }
+
 # Groq API upload (multipart) + model download
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",

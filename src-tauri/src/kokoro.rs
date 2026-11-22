@@ -465,6 +465,7 @@ pub fn speak_chunks(
     let engine = crate::settings::load(app).tts_engine;
     match engine.as_str() {
         "" | "kokoro" => kokoro_speak_chunks(app, text, voice, blend_voice, speed, on_chunk),
+        "phonon" => crate::phonon::speak_chunks(app, text, voice, on_chunk),
         other => Err(anyhow!("unknown TTS engine '{other}' — pick one in Settings")),
     }
 }
