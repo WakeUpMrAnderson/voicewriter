@@ -95,6 +95,22 @@
         "backgroundColor": "#000000"
       },
       {
+        "label": "toast",
+        "title": "VoiceWriter",
+        "url": "toast.html",
+        "width": 360,
+        "height": 64,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": false,
+        "skipTaskbar": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "focus": false
+      },
+      {
         "label": "region-select",
         "title": "Select area",
         "url": "region-select.html",

@@ -117,6 +117,36 @@ impl Action {
         }
     }
 
+    /// Toast shown near the mouse while the rewrite runs.
+    pub fn busy_message(self) -> &'static str {
+        match self {
+            Action::Refine => "Refining…",
+            Action::Professional => "Making it professional…",
+            Action::Humanize => "Humanizing…",
+            _ => "Working…",
+        }
+    }
+
+    /// Toast shown once the rewrite has replaced the selection.
+    pub fn done_message(self) -> &'static str {
+        match self {
+            Action::Refine => "Refined",
+            Action::Professional => "Professional tone applied",
+            Action::Humanize => "Humanized",
+            _ => "Done",
+        }
+    }
+
+    /// Toast shown when the model returned the text unchanged.
+    pub fn unchanged_message(self) -> &'static str {
+        match self {
+            Action::Refine => "Already looks good",
+            Action::Professional => "Already sounds professional",
+            Action::Humanize => "Already sounds natural",
+            _ => "No changes",
+        }
+    }
+
     /// Output-length sanity window: (minimum ratio, maximum ratio, characters
     /// always allowed on top of the input's length). Professional may grow
     /// terse shorthand into full sentences and shrink rambling, so it gets a

@@ -32,7 +32,7 @@ mod wav;
 mod web_browser;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -101,6 +101,8 @@ pub struct AppState {
     /// Set while a rewrite (professional/humanize) is running, so a second
     /// hotkey press during one doesn't stack capture/replace passes.
     refining: AtomicBool,
+    /// Bumped per toast so an older toast's hide timer can't hide a newer one.
+    toast_gen: AtomicU64,
     shortcut_update: Mutex<()>,
     /// Owns current TTS playback so a second hotkey press can stop it.
     speaker: Arc<speak::Speaker>,
@@ -132,6 +134,7 @@ impl AppState {
             shortcut_professional: Mutex::new(None),
             shortcut_humanize: Mutex::new(None),
             refining: AtomicBool::new(false),
+            toast_gen: AtomicU64::new(0),
             shortcut_update: Mutex::new(()),
             speaker: Arc::new(speak::Speaker::new()),
             wheel_text: Mutex::new(String::new()),
@@ -764,6 +767,106 @@ fn on_speak_text(app: &AppHandle<Wry>, text: &str) {
     });
 }
 
+#[derive(Clone, Copy)]
+enum ToastKind {
+    Busy,
+    Done,
+    Error,
+}
+
+impl ToastKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToastKind::Busy => "busy",
+            ToastKind::Done => "done",
+            ToastKind::Error => "error",
+        }
+    }
+}
+
+/// Show a small status pill just below the mouse cursor, without taking
+/// focus from the app the user is working in (rewrites paste back into it).
+/// `hide_after: None` keeps it up until the next toast replaces it.
+fn show_toast(app: &AppHandle<Wry>, kind: ToastKind, text: &str, hide_after: Option<std::time::Duration>) {
+    let Some(win) = app.get_webview_window("toast") else { return };
+    let state: State<AppState> = app.state();
+    let gen = state.toast_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    drop(state);
+    let _ = win.emit("toast", serde_json::json!({ "kind": kind.as_str(), "text": text }));
+    let (x, y) = typer::cursor_pos();
+    let width = win.outer_size().map(|s| s.width as i32).unwrap_or(360);
+    show_without_focus(&win, x - width / 2, y + 24);
+    if let Some(delay) = hide_after {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let state: State<AppState> = app.state();
+            let current = state.toast_gen.load(Ordering::SeqCst) == gen;
+            drop(state);
+            if current {
+                if let Some(win) = app.get_webview_window("toast") {
+                    hide_without_focus(&win);
+                }
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn toast_hwnd(win: &tauri::WebviewWindow<Wry>) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = win.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
+    Some(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut std::ffi::c_void))
+}
+
+/// Tauri's `show()` activates the window, which would steal focus (and the
+/// paste target) from the user's app, so the toast is shown and hidden
+/// through Win32 directly, marked non-activating and topmost.
+#[cfg(windows)]
+fn show_without_focus(win: &tauri::WebviewWindow<Wry>, x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
+    };
+    let Some(hwnd) = toast_hwnd(win) else { return };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn hide_without_focus(win: &tauri::WebviewWindow<Wry>) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE};
+    if let Some(hwnd) = toast_hwnd(win) {
+        unsafe {
+            let _ = ShowWindowAsync(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn show_without_focus(win: &tauri::WebviewWindow<Wry>, x: i32, y: i32) {
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    let _ = win.show();
+}
+
+#[cfg(not(windows))]
+fn hide_without_focus(win: &tauri::WebviewWindow<Wry>) {
+    let _ = win.hide();
+}
+
 /// Rewrite selection (Alt+P / Alt+H, or --professional / --humanize):
 /// capture the selected text, rewrite it via Groq in `action`'s style, and
 /// replace the selection in place. Only one rewrite runs at a time, whatever
@@ -778,6 +881,7 @@ fn on_rewrite_selection(app: &AppHandle<Wry>, action: refine::Action) {
     let target = typer::Target::capture();
     let app = app.clone();
     std::thread::spawn(move || {
+        show_toast(&app, ToastKind::Busy, action.busy_message(), None);
         events::emit(&app, Status::Transcribing, Some("rewriting…".into()));
         let result = rewrite_selection(&app, target, action);
         let state: State<AppState> = app.state();
@@ -786,12 +890,13 @@ fn on_rewrite_selection(app: &AppHandle<Wry>, action: refine::Action) {
         match result {
             Ok(changed) => {
                 events::emit(&app, Status::Idle, None);
-                if !changed {
-                    eprintln!("rewrite: output matched the input — selection left as-is");
-                }
+                let message = if changed { action.done_message() } else { action.unchanged_message() };
+                show_toast(&app, ToastKind::Done, message, Some(std::time::Duration::from_millis(1400)));
             }
             Err(e) => {
-                events::emit(&app, Status::Error, Some(e.to_string()));
+                let message = e.to_string();
+                events::emit(&app, Status::Error, Some(message.clone()));
+                show_toast(&app, ToastKind::Error, &message, Some(std::time::Duration::from_secs(5)));
             }
         }
     });
