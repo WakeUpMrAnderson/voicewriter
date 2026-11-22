@@ -480,12 +480,20 @@ fn split_for_length(text: &str, first_max: usize, max_chars: usize) -> Vec<Strin
     out
 }
 
-/// True if `s` contains a character Kokoro (English-only) and its eSpeak NG
+/// True if `s` contains a *letter* Kokoro (English-only) and its eSpeak NG
 /// phonemizer can't meaningfully read — e.g. Bangla. Callers should check
 /// this and surface a clear "unsupported language" error rather than
 /// silently producing garbled or empty audio.
+///
+/// Only letters count, not punctuation or symbols: prose copied from the web
+/// routinely carries em dashes (—), arrows (→), ellipses (…) and curly quotes
+/// from the General Punctuation / Arrows blocks (U+2000+), and rejecting on
+/// those refused to speak perfectly readable English (issue #1). Kokoro's
+/// vocabulary even includes `—` natively, and eSpeak NG reads `→` aloud as
+/// "right arrow". Non-Latin *scripts* are made of alphabetic letters, so they
+/// are still caught here.
 pub fn needs_unsupported_language(s: &str) -> bool {
-    s.chars().any(|c| c as u32 > 0x024F && !c.is_whitespace())
+    s.chars().any(|c| c.is_alphabetic() && c as u32 > 0x024F)
 }
 
 #[cfg(test)]
@@ -594,7 +602,25 @@ mod tests {
     #[test]
     fn detects_unsupported_non_latin_script() {
         assert!(needs_unsupported_language("আমি ভালো আছি"));
+        assert!(needs_unsupported_language("Привет, мир"));
+        assert!(needs_unsupported_language("你好"));
         assert!(!needs_unsupported_language("hello world"));
         assert!(!needs_unsupported_language(""));
+    }
+
+    /// Punctuation and symbols from the U+2000+ blocks must not be mistaken
+    /// for a non-Latin script — they appear in ordinary English prose and are
+    /// readable (issue #1: "— keep that as a fallback" refused to speak).
+    #[test]
+    fn punctuation_and_symbols_are_not_an_unsupported_language() {
+        assert!(!needs_unsupported_language(
+            "may beat years of engineering — keep that as a fallback, not the plan."
+        ));
+        assert!(!needs_unsupported_language("use the arrow → here"));
+        assert!(!needs_unsupported_language("waiting… “quoted” – en dash"));
+        assert!(!needs_unsupported_language("€100 • bullet point"));
+        // But real words in a non-Latin script interleaved with those symbols
+        // are still rejected.
+        assert!(needs_unsupported_language("— প্ল্যান →"));
     }
 }
