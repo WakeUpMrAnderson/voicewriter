@@ -408,6 +408,12 @@ fn engine(app: &AppHandle<Wry>) -> Result<std::sync::Arc<Kokoro>> {
 /// real error surfaces on the next speak.
 pub fn preload(app: AppHandle<Wry>) {
     std::thread::spawn(move || {
+        // Preload whichever engine is selected — a cold Phonon build costs
+        // ~10 s on first speak, which reads as "the hotkey did nothing".
+        if crate::settings::load(&app).tts_engine == "phonon" {
+            crate::phonon::preload(app);
+            return;
+        }
         let Ok((model, voices)) = crate::model::kokoro_paths(&app) else { return };
         if !model.is_file() || !voices.is_file() {
             return;
