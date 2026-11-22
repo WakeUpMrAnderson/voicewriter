@@ -436,19 +436,11 @@ pub fn unload() {
 }
 
 /// Synthesize `text` aloud and return 16-bit PCM WAV bytes at 24 kHz mono.
-/// `voice` empty = `DEFAULT_VOICE`; `blend_voice` empty = no blend; `pitch`
-/// in semitones (0 = off). See `needs_unsupported_language` for the check
-/// callers should make first.
-pub fn speak(
-    app: &AppHandle<Wry>,
-    text: &str,
-    voice: &str,
-    blend_voice: &str,
-    speed: f32,
-    pitch: f32,
-) -> Result<Vec<u8>> {
+/// `voice` empty = `DEFAULT_VOICE`; `blend_voice` empty = no blend. See
+/// `needs_unsupported_language` for the check callers should make first.
+pub fn speak(app: &AppHandle<Wry>, text: &str, voice: &str, blend_voice: &str, speed: f32) -> Result<Vec<u8>> {
     let mut samples = Vec::new();
-    speak_chunks(app, text, voice, blend_voice, speed, pitch, |chunk| {
+    speak_chunks(app, text, voice, blend_voice, speed, |chunk| {
         samples.extend(chunk);
         Ok(true)
     })?;
@@ -465,7 +457,6 @@ pub fn speak_chunks(
     voice: &str,
     blend_voice: &str,
     speed: f32,
-    pitch: f32,
     mut on_chunk: impl FnMut(Vec<f32>) -> Result<bool>,
 ) -> Result<()> {
     let trimmed = text.trim();
@@ -497,7 +488,6 @@ pub fn speak_chunks(
             speed
         };
         let samples = eng.synthesize(&toks, voice, blend_voice, chunk_speed)?;
-        let samples = if pitch != 0.0 { pitch_shift(&samples, pitch) } else { samples };
         eprintln!(
             "kokoro: chunk {} chars / {} tokens: phonemize {t_ph:?}, synth {:?}, audio {:.1}s",
             chunk_text.len(),
@@ -528,120 +518,6 @@ fn chunk_jitter(idx: usize, chunk_text: &str) -> f32 {
         ^ (chunk_text.len().wrapping_mul(0x9E37_79B9));
     let spread = (h % 41) as f32 / 1000.0; // 0.000..=0.040
     1.0 + spread - 0.02
-}
-
-/// Linear-interpolation resample — intermediate step of `pitch_shift`; the
-/// WSOLA pass after it restores duration, so linear interpolation is plenty.
-fn resample_linear(samples: &[f32], r: f32) -> Vec<f32> {
-    let out_len = ((samples.len() as f32) / r).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for n in 0..out_len {
-        let read = n as f32 * r;
-        let i = read.floor() as usize;
-        let frac = read - i as f32;
-        let s = if i + 1 < samples.len() {
-            samples[i] * (1.0 - frac) + samples[i + 1] * frac
-        } else {
-            samples[samples.len() - 1]
-        };
-        out.push(s);
-    }
-    out
-}
-
-/// WSOLA time-stretch by `alpha` (output length ≈ input length × alpha).
-/// Similarity-aligned overlap-add: each synthesis frame slides its input
-/// read position within ±15 ms to best continue the waveform, which removes
-/// the boundary discontinuities a plain overlap-add resampler produces —
-/// that alignment is what keeps pitched speech free of metallic glitches.
-/// WSOLA tuning: 60 ms Hann window at 24 kHz, 50% overlap (window sums to
-/// 1.0 — constant gain), ±15 ms similarity slide per frame.
-const WSOLA_WINDOW: usize = 1440;
-const WSOLA_HOP: usize = WSOLA_WINDOW / 2;
-const WSOLA_DELTA: i64 = 360;
-
-fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
-    const W: usize = WSOLA_WINDOW;
-    const HS: usize = WSOLA_HOP;
-    const DELTA: i64 = WSOLA_DELTA;
-    let target = ((samples.len() as f32) * alpha).round() as usize;
-    if target <= W || samples.len() <= W {
-        // Degenerate input (callers pass second-long speech chunks).
-        return samples.to_vec();
-    }
-    let win: Vec<f32> = (0..W)
-        .map(|t| 0.5 - 0.5 * (std::f32::consts::TAU * t as f32 / W as f32).cos())
-        .collect();
-    let ha = (((HS as f32) / alpha).round() as usize).max(1); // analysis hop
-    let n_frames = (target - W) / HS + 1; // exact: frames tile `target` fully
-    // Pad the input only by the true shortfall of the last frames, and do it
-    // by MIRRORING the waveform's tail: the frames covering a chunk's final
-    // word then read real signal instead of silence, which used to fade/click
-    // the end of every chunk (zero padding = abrupt energy drop).
-    let nat_max = (n_frames - 1) * ha;
-    let pad = (nat_max + DELTA as usize + W).saturating_sub(samples.len()) + 2;
-    let mut x = samples.to_vec();
-    if pad > 0 {
-        let take = pad.min(x.len());
-        let tail: Vec<f32> = x.iter().rev().take(take).copied().collect();
-        x.extend(tail);
-        while x.len() < samples.len() + pad {
-            x.push(*x.last().unwrap_or(&0.0));
-        }
-    }
-    let padded = x.len();
-    let mut out = vec![0.0f32; target];
-    let mut prev_start: usize = 0; // actual chosen input start of last frame
-    for f in 0..n_frames {
-        let out_pos = f * HS;
-        let nat = f * ha;
-        // Slide the frame start within ±DELTA for the best match against the
-        // waveform's own natural continuation at the nominal position — this
-        // alignment is what keeps the overlap boundaries free of glitches.
-        let mut best_dot = f32::NEG_INFINITY;
-        let mut best_start = nat;
-        if f > 0 {
-            // Reference = the previous frame's ACTUAL content in the overlap
-            // region — matching it keeps the output waveform continuous
-            // across the frame boundary. (Correlating against the nominal
-            // input position instead lets input/output phases diverge, and
-            // the misalignment lands in the output as metallic distortion.)
-            let ref_start = prev_start + HS; // previous segment's second half
-            for d in -DELTA..=DELTA {
-                let pi = nat as i64 + d;
-                if pi < 0 || pi + W as i64 >= padded as i64 {
-                    continue;
-                }
-                let p = pi as usize;
-                let mut dot = 0.0f32;
-                for t in 0..HS {
-                    dot += x[p + t] * x[ref_start + t];
-                }
-                if dot > best_dot {
-                    best_dot = dot;
-                    best_start = p;
-                }
-            }
-        }
-        for t in 0..W {
-            out[out_pos + t] += x[best_start + t] * win[t];
-        }
-        prev_start = best_start;
-    }
-    out
-}
-
-/// Pitch shifter: resample by the pitch ratio (changes pitch and duration),
-/// then WSOLA-stretch back to the original duration — net effect is pitch
-/// alone, with WSOLA's similarity alignment keeping the voice clean at the
-/// slider's extremes. Zero-cost at 0 semitones (callers skip it there).
-fn pitch_shift(samples: &[f32], semitones: f32) -> Vec<f32> {
-    let r = 2f32.powf(semitones / 12.0);
-    if (r - 1.0).abs() < 0.01 {
-        return samples.to_vec();
-    }
-    let resampled = resample_linear(samples, r);
-    wsola_stretch(&resampled, r)
 }
 
 /// Split text into chunks for streamed synthesis: the first chunk is cut at
@@ -841,89 +717,6 @@ mod tests {
         let mut a = vec![1.0, 3.0];
         blend_styles(&mut a, &[2.0, 5.0]);
         assert_eq!(a, vec![1.5, 4.0]);
-    }
-
-    /// 1 s of 220 Hz sine, shifted +12 semitones: duration preserved, output
-    /// clean, and the zero-crossing rate roughly doubles (= pitch doubled).
-    #[test]
-    fn pitch_shift_moves_pitch_keeps_length() {
-        let sr = 24_000;
-        let input: Vec<f32> = (0..sr)
-            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
-            .collect();
-        let out = pitch_shift(&input, 12.0);
-        assert!((out.len() as i64 - input.len() as i64).abs() <= 2, "{} vs {}", out.len(), input.len());
-        assert!(out.iter().all(|s| s.is_finite()));
-        let zc = |s: &[f32]| {
-            s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count()
-        };
-        let (zin, zout) = (zc(&input), zc(&out));
-        assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.3, "zc {zin} -> {zout}");
-        // 0 semitones is a pass-through (no processing at all).
-        assert_eq!(pitch_shift(&input, 0.0), input);
-    }
-
-    /// WSOLA alone: stretching a sine by 2x doubles its length at roughly
-    /// the same pitch. The zc tolerance is loose on purpose: a *perfectly
-    /// periodic* test sine gives WSOLA's correlation identical peaks at every
-    /// period multiple, so it may slip whole periods (±few %); real speech's
-    /// formant structure pins the alignment, which is where WSOLA shines.
-    #[test]
-    fn wsola_stretch_changes_length_not_pitch() {
-        let sr = 24_000;
-        let input: Vec<f32> = (0..sr)
-            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
-            .collect();
-        let out = wsola_stretch(&input, 2.0);
-        assert!((out.len() as f64 - input.len() as f64 * 2.0).abs() <= 2.0, "{}", out.len());
-        let zc = |s: &[f32]| s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
-        let (zin, zout) = (zc(&input), zc(&out));
-        // Same pitch over twice the duration = twice the total crossings.
-        assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.25, "zc {zin} -> {zout}");
-    }
-
-    /// THE regression test for the distortion report: a chirp is
-    /// deliberately non-periodic, so broken frame alignment shows up as
-    /// isolated sample jumps at the synthesis-frame boundaries. Aligned
-    /// overlap-add keeps boundary jumps within the signal's normal range.
-    #[test]
-    fn pitch_shift_output_has_no_boundary_glitches() {
-        let sr = 24_000;
-        let input: Vec<f32> = (0..sr)
-            .map(|n| {
-                let f = 220.0 + (880.0 - 220.0) * (n as f32 / sr as f32);
-                (2.0 * std::f32::consts::PI * f * n as f32 / sr as f32).sin()
-            })
-            .collect();
-        for st in [-5.0f32, 5.0] {
-            let out = pitch_shift(&input, st);
-            let mean_abs =
-                out.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (out.len() - 1) as f32;
-            let max_boundary = (1..out.len() / WSOLA_HOP)
-                .map(|k| (out[k * WSOLA_HOP] - out[k * WSOLA_HOP - 1]).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_boundary <= 8.0 * mean_abs.max(1e-6),
-                "st {st}: max boundary jump {max_boundary} vs mean sample delta {mean_abs}"
-            );
-        }
-    }
-
-    /// Downward shifts work symmetrically (this is the direction that used
-    /// to glitch worst).
-    #[test]
-    fn pitch_shift_down_stays_clean() {
-        let sr = 24_000;
-        let input: Vec<f32> = (0..sr)
-            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
-            .collect();
-        let out = pitch_shift(&input, -5.0);
-        assert!((out.len() as i64 - input.len() as i64).abs() <= 2);
-        assert!(out.iter().all(|s| s.is_finite()));
-        let zc = |s: &[f32]| s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
-        // -5 semitones = ratio 0.707 → crossings drop by the same factor.
-        let ratio = zc(&out) as f32 / zc(&input) as f32;
-        assert!((ratio - 0.707).abs() < 0.1, "zc ratio {ratio}");
     }
 
     #[test]

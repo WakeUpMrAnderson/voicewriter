@@ -342,6 +342,13 @@ input[type="range"] {
   accent-color: var(--accent);
 }
 
+/* Fixed-width value labels keep every slider track the same length. */
+#ttsSpeedVal,
+#ttsVolumeVal {
+  min-width: 4ch;
+  text-align: right;
+}
+
 .check {
   display: flex;
   align-items: center;

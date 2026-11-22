@@ -280,7 +280,6 @@ pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &st
         &cfg.tts_voice,
         &cfg.tts_blend_voice,
         cfg.tts_speed,
-        cfg.tts_pitch,
         |samples| {
             let mut samples = samples;
             fader.apply(&mut samples);

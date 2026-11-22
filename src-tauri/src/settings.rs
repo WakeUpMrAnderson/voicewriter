@@ -52,10 +52,6 @@ pub struct Settings {
     pub tts_voice: String,
     /// Kokoro speech rate multiplier. 1.0 = normal.
     pub tts_speed: f32,
-    /// TTS pitch shift in semitones (-5..5, 0 = original voice), applied as
-    /// a granular post-process on the waveform — Kokoro's model has no pitch
-    /// input, so the shift happens after synthesis. 0 = no processing.
-    pub tts_pitch: f32,
     /// TTS playback volume multiplier, 0.0 (mute) .. 1.0 (full).
     pub tts_volume: f32,
     /// Optional second Kokoro voice id blended into `tts_voice` (50/50
@@ -106,7 +102,6 @@ impl Default for Settings {
             hide_tray: false,
             tts_voice: String::new(),
             tts_speed: 1.0,
-            tts_pitch: 0.0,
             tts_volume: 1.0,
             tts_blend_voice: String::new(),
             professional_hotkey: "Alt+P".to_string(),

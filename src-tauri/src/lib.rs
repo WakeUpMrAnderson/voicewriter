@@ -2062,15 +2062,8 @@ async fn test_tts_voice(app: AppHandle<Wry>, voice: String) -> Result<(), String
     drop(state);
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = crate::settings::load(&app);
-        let audio = kokoro::speak(
-            &app,
-            "This is what this voice sounds like.",
-            &voice,
-            &cfg.tts_blend_voice,
-            1.0,
-            cfg.tts_pitch,
-        )
-        .map_err(|e| e.to_string())?;
+        let audio = kokoro::speak(&app, "This is what this voice sounds like.", &voice, &cfg.tts_blend_voice, 1.0)
+            .map_err(|e| e.to_string())?;
         speak::play_and_wait(&app, &speaker, audio, cfg.tts_volume).map_err(|e| e.to_string())
     })
     .await
