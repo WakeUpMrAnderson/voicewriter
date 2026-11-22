@@ -342,7 +342,12 @@ input[type="range"] {
   accent-color: var(--accent);
 }
 
-/* Fixed-width value labels keep every slider track the same length. */
+/* Fixed-width value labels AND labels keep every slider track the same
+   length — flexbox then guarantees identical geometry for both rows. */
+#ttsSpeedRow > label,
+#ttsVolumeRow > label {
+  min-width: 7ch;
+}
 #ttsSpeedVal,
 #ttsVolumeVal {
   min-width: 4ch;
