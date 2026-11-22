@@ -451,7 +451,26 @@ pub fn speak(app: &AppHandle<Wry>, text: &str, voice: &str, blend_voice: &str, s
 /// samples to `on_chunk` as soon as it's ready so playback can start after
 /// the first sentence instead of after the whole selection. `on_chunk`
 /// returns `Ok(false)` to stop early (e.g. playback was cancelled).
+/// Entry point for every TTS flow: dispatches to the engine chosen in
+/// Settings (`tts_engine`). The Phonon engine plugs in here in 5.6.0 M2;
+/// until then anything other than "kokoro" is an explicit error.
 pub fn speak_chunks(
+    app: &AppHandle<Wry>,
+    text: &str,
+    voice: &str,
+    blend_voice: &str,
+    speed: f32,
+    mut on_chunk: impl FnMut(Vec<f32>) -> Result<bool>,
+) -> Result<()> {
+    let engine = crate::settings::load(app).tts_engine;
+    match engine.as_str() {
+        "" | "kokoro" => kokoro_speak_chunks(app, text, voice, blend_voice, speed, on_chunk),
+        other => Err(anyhow!("unknown TTS engine '{other}' — pick one in Settings")),
+    }
+}
+
+/// The Kokoro-82M pipeline: chunk, phonemize (misaki), synthesize, jitter.
+fn kokoro_speak_chunks(
     app: &AppHandle<Wry>,
     text: &str,
     voice: &str,

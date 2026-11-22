@@ -46,6 +46,9 @@ pub struct Settings {
     /// Run with no tray icon at all. Settings is then reachable only via
     /// `voicewriter --settings` (or launching the app again).
     pub hide_tray: bool,
+    /// Which TTS engine synthesizes speech: "kokoro" (offline Kokoro-82M,
+    /// the default) or "phonon" (Gradium Phonon 31M, added in 5.6.0).
+    pub tts_engine: String,
     /// Kokoro voice id (e.g. "af_heart") used by "speak selected text" and
     /// the wheel's spoken translations. Empty = a sane built-in default (see
     /// `kokoro.rs::DEFAULT_VOICE`).
@@ -100,6 +103,7 @@ impl Default for Settings {
             polish: true,
             autostart: false,
             hide_tray: false,
+            tts_engine: "kokoro".to_string(),
             tts_voice: String::new(),
             tts_speed: 1.0,
             tts_volume: 1.0,
