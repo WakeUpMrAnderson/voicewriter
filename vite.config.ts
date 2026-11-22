@@ -10,6 +10,10 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // Bind IPv4 loopback explicitly: newer Node resolves "localhost" to ::1,
+    // and tauri-cli's dev-server probe then can't connect over 127.0.0.1
+    // ("Could not connect to http://localhost:1420/ after 180s").
+    host: "127.0.0.1",
     watch: {
       // tauri src is watched by the tauri cli, not vite
       ignored: ["**/src-tauri/**"],
