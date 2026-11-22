@@ -530,42 +530,91 @@ fn chunk_jitter(idx: usize, chunk_text: &str) -> f32 {
     1.0 + spread - 0.02
 }
 
-/// Granular pitch shifter: shifts the pitch by `semitones` while keeping the
-/// duration, by resampling *inside* 50 ms Hann-windowed grains whose hop is
-/// the same on input and output — the overlap-add preserves length (windows
-/// sum to 1.0 at 50% overlap, COLA), and the in-grain read stride carries
-/// the pitch. Linear interpolation between input samples keeps the grain
-/// read continuous. Zero-cost at 0 semitones (callers skip it there).
+/// Linear-interpolation resample — intermediate step of `pitch_shift`; the
+/// WSOLA pass after it restores duration, so linear interpolation is plenty.
+fn resample_linear(samples: &[f32], r: f32) -> Vec<f32> {
+    let out_len = ((samples.len() as f32) / r).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for n in 0..out_len {
+        let read = n as f32 * r;
+        let i = read.floor() as usize;
+        let frac = read - i as f32;
+        let s = if i + 1 < samples.len() {
+            samples[i] * (1.0 - frac) + samples[i + 1] * frac
+        } else {
+            samples[samples.len() - 1]
+        };
+        out.push(s);
+    }
+    out
+}
+
+/// WSOLA time-stretch by `alpha` (output length ≈ input length × alpha).
+/// Similarity-aligned overlap-add: each synthesis frame slides its input
+/// read position within ±15 ms to best continue the waveform, which removes
+/// the boundary discontinuities a plain overlap-add resampler produces —
+/// that alignment is what keeps pitched speech free of metallic glitches.
+fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
+    const W: usize = 1440; // 60 ms window at 24 kHz
+    const HS: usize = W / 2; // synthesis hop — 50% overlap, Hann sums to 1
+    const DELTA: i64 = 360; // ±15 ms similarity search
+    let target = ((samples.len() as f32) * alpha).round() as usize;
+    if target <= W || samples.len() <= W {
+        // Degenerate input (callers pass second-long speech chunks).
+        return samples.to_vec();
+    }
+    let win: Vec<f32> = (0..W)
+        .map(|t| 0.5 - 0.5 * (std::f32::consts::TAU * t as f32 / W as f32).cos())
+        .collect();
+    let ha = (((HS as f32) / alpha).round() as usize).max(1); // analysis hop
+    // Pad the input with silence so every frame — including the last ones
+    // with their ±DELTA slide — can always read a full window.
+    let mut x = samples.to_vec();
+    x.extend(std::iter::repeat(0.0).take(W + DELTA as usize));
+    let padded = x.len();
+    let n_frames = (target - W) / HS + 1; // exact: frames tile `target` fully
+    let mut out = vec![0.0f32; target];
+    for f in 0..n_frames {
+        let out_pos = f * HS;
+        let nat = f * ha;
+        // Slide the frame start within ±DELTA for the best match against the
+        // waveform's own natural continuation at the nominal position — this
+        // alignment is what keeps the overlap boundaries free of glitches.
+        let mut best_dot = f32::NEG_INFINITY;
+        let mut best_start = nat;
+        for d in -DELTA..=DELTA {
+            let pi = nat as i64 + d;
+            if pi < 0 || pi + W as i64 >= padded as i64 {
+                continue;
+            }
+            let p = pi as usize;
+            let mut dot = 0.0f32;
+            for t in 0..HS {
+                dot += x[p + t] * x[nat + t];
+            }
+            if dot > best_dot {
+                best_dot = dot;
+                best_start = p;
+            }
+        }
+        for t in 0..W {
+            out[out_pos + t] += x[best_start + t] * win[t];
+        }
+    }
+    out
+}
+
+/// Pitch shifter: resample by the pitch ratio (changes pitch and duration),
+/// then WSOLA-stretch back to the original duration — net effect is pitch
+/// alone, with WSOLA's similarity alignment keeping the voice clean at the
+/// slider's extremes. Zero-cost at 0 semitones (callers skip it there).
 fn pitch_shift(samples: &[f32], semitones: f32) -> Vec<f32> {
     let r = 2f32.powf(semitones / 12.0);
     if (r - 1.0).abs() < 0.01 {
         return samples.to_vec();
     }
-    const GRAIN: usize = 1200; // 50 ms at 24 kHz
-    const HOP: usize = GRAIN / 2;
-    let win: Vec<f32> = (0..GRAIN)
-        .map(|t| 0.5 - 0.5 * (std::f32::consts::TAU * t as f32 / GRAIN as f32).cos())
-        .collect();
-
-    let mut out = vec![0.0f32; samples.len()];
-    let grain_in = (GRAIN as f32 * r).ceil() as usize;
-    let mut pos = 0usize; // same hop on input and output
-    while pos + GRAIN <= out.len() && pos + grain_in + 1 < samples.len() {
-        let mut read = pos as f32;
-        for t in 0..GRAIN {
-            let i = read.floor() as usize;
-            let frac = read - i as f32;
-            let s = if i + 1 < samples.len() {
-                samples[i] * (1.0 - frac) + samples[i + 1] * frac
-            } else {
-                samples[i]
-            };
-            out[pos + t] += s * win[t];
-            read += r;
-        }
-        pos += HOP;
-    }
-    out
+    let resampled = resample_linear(samples, r);
+    wsola_stretch(&resampled, r)
 }
 
 /// Split text into chunks for streamed synthesis: the first chunk is cut at
@@ -776,7 +825,7 @@ mod tests {
             .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
             .collect();
         let out = pitch_shift(&input, 12.0);
-        assert_eq!(out.len(), input.len());
+        assert!((out.len() as i64 - input.len() as i64).abs() <= 2, "{} vs {}", out.len(), input.len());
         assert!(out.iter().all(|s| s.is_finite()));
         let zc = |s: &[f32]| {
             s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count()
@@ -785,6 +834,42 @@ mod tests {
         assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.3, "zc {zin} -> {zout}");
         // 0 semitones is a pass-through (no processing at all).
         assert_eq!(pitch_shift(&input, 0.0), input);
+    }
+
+    /// WSOLA alone: stretching a sine by 2x doubles its length at roughly
+    /// the same pitch. The zc tolerance is loose on purpose: a *perfectly
+    /// periodic* test sine gives WSOLA's correlation identical peaks at every
+    /// period multiple, so it may slip whole periods (±few %); real speech's
+    /// formant structure pins the alignment, which is where WSOLA shines.
+    #[test]
+    fn wsola_stretch_changes_length_not_pitch() {
+        let sr = 24_000;
+        let input: Vec<f32> = (0..sr)
+            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
+            .collect();
+        let out = wsola_stretch(&input, 2.0);
+        assert!((out.len() as f64 - input.len() as f64 * 2.0).abs() <= 2.0, "{}", out.len());
+        let zc = |s: &[f32]| s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        let (zin, zout) = (zc(&input), zc(&out));
+        // Same pitch over twice the duration = twice the total crossings.
+        assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.25, "zc {zin} -> {zout}");
+    }
+
+    /// Downward shifts work symmetrically (this is the direction that used
+    /// to glitch worst).
+    #[test]
+    fn pitch_shift_down_stays_clean() {
+        let sr = 24_000;
+        let input: Vec<f32> = (0..sr)
+            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
+            .collect();
+        let out = pitch_shift(&input, -5.0);
+        assert!((out.len() as i64 - input.len() as i64).abs() <= 2);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let zc = |s: &[f32]| s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        // -5 semitones = ratio 0.707 → crossings drop by the same factor.
+        let ratio = zc(&out) as f32 / zc(&input) as f32;
+        assert!((ratio - 0.707).abs() < 0.1, "zc ratio {ratio}");
     }
 
     #[test]
