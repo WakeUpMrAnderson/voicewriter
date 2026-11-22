@@ -20,6 +20,8 @@ interface Settings {
   hideTray: boolean;
   ttsVoice: string;
   ttsSpeed: number;
+  ttsPitch: number;
+  ttsVolume: number;
   visionModel: string;
 }
 
@@ -190,6 +192,10 @@ async function loadSettings() {
   hideTrayChk.checked = settings.hideTray;
   ttsSpeedInput.value = String(settings.ttsSpeed || 1.0);
   ttsSpeedVal.textContent = Number(ttsSpeedInput.value).toFixed(1) + "×";
+  ttsPitchInput.value = String(settings.ttsPitch ?? 0);
+  ttsPitchVal.textContent = `${Number(ttsPitchInput.value)} st`;
+  ttsVolumeInput.value = String(settings.ttsVolume ?? 1);
+  ttsVolumeVal.textContent = `${Math.round(Number(ttsVolumeInput.value) * 100)}%`;
 }
 
 async function save(patch: Partial<Settings>) {
@@ -458,6 +464,12 @@ const ttsVoiceSel = $<HTMLSelectElement>("ttsVoice");
 const ttsSpeedRow = $("ttsSpeedRow");
 const ttsSpeedInput = $<HTMLInputElement>("ttsSpeed");
 const ttsSpeedVal = $("ttsSpeedVal");
+const ttsPitchRow = $("ttsPitchRow");
+const ttsPitchInput = $<HTMLInputElement>("ttsPitch");
+const ttsPitchVal = $("ttsPitchVal");
+const ttsVolumeRow = $("ttsVolumeRow");
+const ttsVolumeInput = $<HTMLInputElement>("ttsVolume");
+const ttsVolumeVal = $("ttsVolumeVal");
 const ttsPreviewRow = $("ttsPreviewRow");
 const ttsPreviewBtn = $<HTMLButtonElement>("ttsPreview");
 
@@ -543,6 +555,8 @@ async function refreshVoiceModels() {
     const ttsReady = tts.some((m) => m.present);
     ttsVoiceRow.hidden = !ttsReady;
     ttsSpeedRow.hidden = !ttsReady;
+    ttsPitchRow.hidden = !ttsReady;
+    ttsVolumeRow.hidden = !ttsReady;
     ttsPreviewRow.hidden = !ttsReady;
 
     const totalSize = await invoke<string>("voice_models_total_size");
@@ -575,6 +589,20 @@ ttsSpeedInput.addEventListener("input", () => {
 });
 ttsSpeedInput.addEventListener("change", () =>
   save({ ttsSpeed: Number(ttsSpeedInput.value) }),
+);
+
+ttsPitchInput.addEventListener("input", () => {
+  ttsPitchVal.textContent = `${Number(ttsPitchInput.value)} st`;
+});
+ttsPitchInput.addEventListener("change", () =>
+  save({ ttsPitch: Number(ttsPitchInput.value) }),
+);
+
+ttsVolumeInput.addEventListener("input", () => {
+  ttsVolumeVal.textContent = `${Math.round(Number(ttsVolumeInput.value) * 100)}%`;
+});
+ttsVolumeInput.addEventListener("change", () =>
+  save({ ttsVolume: Number(ttsVolumeInput.value) }),
 );
 
 ttsPreviewBtn.addEventListener("click", async () => {

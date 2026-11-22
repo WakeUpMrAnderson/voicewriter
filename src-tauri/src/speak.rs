@@ -87,10 +87,11 @@ impl Speaker {
     }
 
     /// Decode `wav_bytes` and start playing them, replacing any current playback.
-    /// Returns a generation counter identifying this playback, so the caller
-    /// can wait for *this* clip to finish (and poll its progress) without
-    /// mixing it up with a later one.
-    fn play(&self, wav_bytes: Vec<u8>) -> Result<u64> {
+    /// `volume` is a 0.0..1.0 multiplier on the output sink. Returns a
+    /// generation counter identifying this playback, so the caller can wait
+    /// for *this* clip to finish (and poll its progress) without mixing it up
+    /// with a later one.
+    fn play(&self, wav_bytes: Vec<u8>, volume: f32) -> Result<u64> {
         eprintln!("speak: got {} bytes of synthesized audio", wav_bytes.len());
         let (stream, handle): (OutputStream, OutputStreamHandle) =
             rodio::OutputStream::try_default().context("open audio output device")?;
@@ -101,7 +102,7 @@ impl Speaker {
         let total = source.total_duration();
         eprintln!("speak: decoded, total_duration={total:?}");
         sink.append(source);
-        sink.set_volume(1.0);
+        sink.set_volume(volume.clamp(0.0, 1.0));
 
         let mut guard = self.active.lock();
         if let Some(old) = guard.take() {
@@ -113,13 +114,14 @@ impl Speaker {
     }
 
     /// Start playing raw 24 kHz mono samples, replacing any current playback.
-    /// More audio can be queued onto the same playback with `append()`.
-    fn play_samples(&self, samples: Vec<f32>) -> Result<u64> {
+    /// `volume` is a 0.0..1.0 multiplier on the output sink. More audio can
+    /// be queued onto the same playback with `append()`.
+    fn play_samples(&self, samples: Vec<f32>, volume: f32) -> Result<u64> {
         let (stream, handle): (OutputStream, OutputStreamHandle) =
             rodio::OutputStream::try_default().context("open audio output device")?;
         let sink = Sink::try_new(&handle).context("create audio sink")?;
         sink.append(SamplesBuffer::new(1, crate::kokoro::SAMPLE_RATE, samples));
-        sink.set_volume(1.0);
+        sink.set_volume(volume.clamp(0.0, 1.0));
 
         let mut guard = self.active.lock();
         if let Some(old) = guard.take() {
@@ -272,19 +274,27 @@ pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &st
     let cfg = crate::settings::load(app);
     let mut gen: Option<u64> = None;
     let mut fader = Crossfader::new();
-    crate::kokoro::speak_chunks(app, text, &cfg.tts_voice, &cfg.tts_blend_voice, cfg.tts_speed, |samples| {
-        let mut samples = samples;
-        fader.apply(&mut samples);
-        match gen {
-            None => {
-                gen = Some(speaker.play_samples(samples)?);
-                eprintln!("speak: first audio after {:?}", t0.elapsed());
-                crate::events::emit(app, crate::events::Status::Speaking, Some("playing…".into()));
-                Ok(true)
+    crate::kokoro::speak_chunks(
+        app,
+        text,
+        &cfg.tts_voice,
+        &cfg.tts_blend_voice,
+        cfg.tts_speed,
+        cfg.tts_pitch,
+        |samples| {
+            let mut samples = samples;
+            fader.apply(&mut samples);
+            match gen {
+                None => {
+                    gen = Some(speaker.play_samples(samples, cfg.tts_volume)?);
+                    eprintln!("speak: first audio after {:?}", t0.elapsed());
+                    crate::events::emit(app, crate::events::Status::Speaking, Some("playing…".into()));
+                    Ok(true)
+                }
+                Some(g) => Ok(speaker.append(g, samples)),
             }
-            Some(g) => Ok(speaker.append(g, samples)),
-        }
-    })?;
+        },
+    )?;
     if let Some(g) = gen {
         speaker.wait_until_done(g, |_| {});
     }
@@ -296,9 +306,14 @@ pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &st
 /// as `speak()`. Shared by `speak()` above and the refine wheel's
 /// speak-the-translation flow, which synthesizes audio itself (via eSpeak NG
 /// or Groq, depending on the target language) before handing it off here.
-pub fn play_and_wait(app: &tauri::AppHandle, speaker: &Arc<Speaker>, audio: Vec<u8>) -> Result<()> {
+pub fn play_and_wait(
+    app: &tauri::AppHandle,
+    speaker: &Arc<Speaker>,
+    audio: Vec<u8>,
+    volume: f32,
+) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let gen = speaker.play(audio)?;
+    let gen = speaker.play(audio, volume)?;
     eprintln!("speak: playback started (gen={gen})");
     crate::events::emit(app, crate::events::Status::Speaking, Some("playing… 0%".into()));
     speaker.wait_until_done(gen, |pct| {

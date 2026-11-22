@@ -436,11 +436,19 @@ pub fn unload() {
 }
 
 /// Synthesize `text` aloud and return 16-bit PCM WAV bytes at 24 kHz mono.
-/// `voice` empty = `DEFAULT_VOICE`; `blend_voice` empty = no blend. See
-/// `needs_unsupported_language` for the check callers should make first.
-pub fn speak(app: &AppHandle<Wry>, text: &str, voice: &str, blend_voice: &str, speed: f32) -> Result<Vec<u8>> {
+/// `voice` empty = `DEFAULT_VOICE`; `blend_voice` empty = no blend; `pitch`
+/// in semitones (0 = off). See `needs_unsupported_language` for the check
+/// callers should make first.
+pub fn speak(
+    app: &AppHandle<Wry>,
+    text: &str,
+    voice: &str,
+    blend_voice: &str,
+    speed: f32,
+    pitch: f32,
+) -> Result<Vec<u8>> {
     let mut samples = Vec::new();
-    speak_chunks(app, text, voice, blend_voice, speed, |chunk| {
+    speak_chunks(app, text, voice, blend_voice, speed, pitch, |chunk| {
         samples.extend(chunk);
         Ok(true)
     })?;
@@ -457,6 +465,7 @@ pub fn speak_chunks(
     voice: &str,
     blend_voice: &str,
     speed: f32,
+    pitch: f32,
     mut on_chunk: impl FnMut(Vec<f32>) -> Result<bool>,
 ) -> Result<()> {
     let trimmed = text.trim();
@@ -488,6 +497,7 @@ pub fn speak_chunks(
             speed
         };
         let samples = eng.synthesize(&toks, voice, blend_voice, chunk_speed)?;
+        let samples = if pitch != 0.0 { pitch_shift(&samples, pitch) } else { samples };
         eprintln!(
             "kokoro: chunk {} chars / {} tokens: phonemize {t_ph:?}, synth {:?}, audio {:.1}s",
             chunk_text.len(),
@@ -518,6 +528,44 @@ fn chunk_jitter(idx: usize, chunk_text: &str) -> f32 {
         ^ (chunk_text.len().wrapping_mul(0x9E37_79B9));
     let spread = (h % 41) as f32 / 1000.0; // 0.000..=0.040
     1.0 + spread - 0.02
+}
+
+/// Granular pitch shifter: shifts the pitch by `semitones` while keeping the
+/// duration, by resampling *inside* 50 ms Hann-windowed grains whose hop is
+/// the same on input and output — the overlap-add preserves length (windows
+/// sum to 1.0 at 50% overlap, COLA), and the in-grain read stride carries
+/// the pitch. Linear interpolation between input samples keeps the grain
+/// read continuous. Zero-cost at 0 semitones (callers skip it there).
+fn pitch_shift(samples: &[f32], semitones: f32) -> Vec<f32> {
+    let r = 2f32.powf(semitones / 12.0);
+    if (r - 1.0).abs() < 0.01 {
+        return samples.to_vec();
+    }
+    const GRAIN: usize = 1200; // 50 ms at 24 kHz
+    const HOP: usize = GRAIN / 2;
+    let win: Vec<f32> = (0..GRAIN)
+        .map(|t| 0.5 - 0.5 * (std::f32::consts::TAU * t as f32 / GRAIN as f32).cos())
+        .collect();
+
+    let mut out = vec![0.0f32; samples.len()];
+    let grain_in = (GRAIN as f32 * r).ceil() as usize;
+    let mut pos = 0usize; // same hop on input and output
+    while pos + GRAIN <= out.len() && pos + grain_in + 1 < samples.len() {
+        let mut read = pos as f32;
+        for t in 0..GRAIN {
+            let i = read.floor() as usize;
+            let frac = read - i as f32;
+            let s = if i + 1 < samples.len() {
+                samples[i] * (1.0 - frac) + samples[i + 1] * frac
+            } else {
+                samples[i]
+            };
+            out[pos + t] += s * win[t];
+            read += r;
+        }
+        pos += HOP;
+    }
+    out
 }
 
 /// Split text into chunks for streamed synthesis: the first chunk is cut at
@@ -717,6 +765,26 @@ mod tests {
         let mut a = vec![1.0, 3.0];
         blend_styles(&mut a, &[2.0, 5.0]);
         assert_eq!(a, vec![1.5, 4.0]);
+    }
+
+    /// 1 s of 220 Hz sine, shifted +12 semitones: duration preserved, output
+    /// clean, and the zero-crossing rate roughly doubles (= pitch doubled).
+    #[test]
+    fn pitch_shift_moves_pitch_keeps_length() {
+        let sr = 24_000;
+        let input: Vec<f32> = (0..sr)
+            .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sr as f32).sin())
+            .collect();
+        let out = pitch_shift(&input, 12.0);
+        assert_eq!(out.len(), input.len());
+        assert!(out.iter().all(|s| s.is_finite()));
+        let zc = |s: &[f32]| {
+            s.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count()
+        };
+        let (zin, zout) = (zc(&input), zc(&out));
+        assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.3, "zc {zin} -> {zout}");
+        // 0 semitones is a pass-through (no processing at all).
+        assert_eq!(pitch_shift(&input, 0.0), input);
     }
 
     #[test]
