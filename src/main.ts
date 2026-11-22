@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -197,6 +198,15 @@ async function loadSettings() {
   ttsVolumeInput.value = String(settings.ttsVolume ?? 1);
   ttsVolumeVal.textContent = `${Math.round(Number(ttsVolumeInput.value) * 100)}%`;
 }
+
+// Real app version from the Tauri runtime — never goes stale like a
+// hardcoded footer string did (v5.5.0 shown after 5.5.1 shipped).
+getVersion()
+  .then((v) => {
+    const el = document.getElementById("appVersion");
+    if (el) el.textContent = `v${v}`;
+  })
+  .catch(() => {});
 
 async function save(patch: Partial<Settings>) {
   settings = { ...settings, ...patch };

@@ -554,10 +554,16 @@ fn resample_linear(samples: &[f32], r: f32) -> Vec<f32> {
 /// read position within ±15 ms to best continue the waveform, which removes
 /// the boundary discontinuities a plain overlap-add resampler produces —
 /// that alignment is what keeps pitched speech free of metallic glitches.
+/// WSOLA tuning: 60 ms Hann window at 24 kHz, 50% overlap (window sums to
+/// 1.0 — constant gain), ±15 ms similarity slide per frame.
+const WSOLA_WINDOW: usize = 1440;
+const WSOLA_HOP: usize = WSOLA_WINDOW / 2;
+const WSOLA_DELTA: i64 = 360;
+
 fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
-    const W: usize = 1440; // 60 ms window at 24 kHz
-    const HS: usize = W / 2; // synthesis hop — 50% overlap, Hann sums to 1
-    const DELTA: i64 = 360; // ±15 ms similarity search
+    const W: usize = WSOLA_WINDOW;
+    const HS: usize = WSOLA_HOP;
+    const DELTA: i64 = WSOLA_DELTA;
     let target = ((samples.len() as f32) * alpha).round() as usize;
     if target <= W || samples.len() <= W {
         // Degenerate input (callers pass second-long speech chunks).
@@ -574,6 +580,7 @@ fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
     let padded = x.len();
     let n_frames = (target - W) / HS + 1; // exact: frames tile `target` fully
     let mut out = vec![0.0f32; target];
+    let mut prev_start: usize = 0; // actual chosen input start of last frame
     for f in 0..n_frames {
         let out_pos = f * HS;
         let nat = f * ha;
@@ -582,24 +589,33 @@ fn wsola_stretch(samples: &[f32], alpha: f32) -> Vec<f32> {
         // alignment is what keeps the overlap boundaries free of glitches.
         let mut best_dot = f32::NEG_INFINITY;
         let mut best_start = nat;
-        for d in -DELTA..=DELTA {
-            let pi = nat as i64 + d;
-            if pi < 0 || pi + W as i64 >= padded as i64 {
-                continue;
-            }
-            let p = pi as usize;
-            let mut dot = 0.0f32;
-            for t in 0..HS {
-                dot += x[p + t] * x[nat + t];
-            }
-            if dot > best_dot {
-                best_dot = dot;
-                best_start = p;
+        if f > 0 {
+            // Reference = the previous frame's ACTUAL content in the overlap
+            // region — matching it keeps the output waveform continuous
+            // across the frame boundary. (Correlating against the nominal
+            // input position instead lets input/output phases diverge, and
+            // the misalignment lands in the output as metallic distortion.)
+            let ref_start = prev_start + HS; // previous segment's second half
+            for d in -DELTA..=DELTA {
+                let pi = nat as i64 + d;
+                if pi < 0 || pi + W as i64 >= padded as i64 {
+                    continue;
+                }
+                let p = pi as usize;
+                let mut dot = 0.0f32;
+                for t in 0..HS {
+                    dot += x[p + t] * x[ref_start + t];
+                }
+                if dot > best_dot {
+                    best_dot = dot;
+                    best_start = p;
+                }
             }
         }
         for t in 0..W {
             out[out_pos + t] += x[best_start + t] * win[t];
         }
+        prev_start = best_start;
     }
     out
 }
@@ -853,6 +869,33 @@ mod tests {
         let (zin, zout) = (zc(&input), zc(&out));
         // Same pitch over twice the duration = twice the total crossings.
         assert!((zout as f32 / zin as f32 - 2.0).abs() < 0.25, "zc {zin} -> {zout}");
+    }
+
+    /// THE regression test for the distortion report: a chirp is
+    /// deliberately non-periodic, so broken frame alignment shows up as
+    /// isolated sample jumps at the synthesis-frame boundaries. Aligned
+    /// overlap-add keeps boundary jumps within the signal's normal range.
+    #[test]
+    fn pitch_shift_output_has_no_boundary_glitches() {
+        let sr = 24_000;
+        let input: Vec<f32> = (0..sr)
+            .map(|n| {
+                let f = 220.0 + (880.0 - 220.0) * (n as f32 / sr as f32);
+                (2.0 * std::f32::consts::PI * f * n as f32 / sr as f32).sin()
+            })
+            .collect();
+        for st in [-5.0f32, 5.0] {
+            let out = pitch_shift(&input, st);
+            let mean_abs =
+                out.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (out.len() - 1) as f32;
+            let max_boundary = (1..out.len() / WSOLA_HOP)
+                .map(|k| (out[k * WSOLA_HOP] - out[k * WSOLA_HOP - 1]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_boundary <= 8.0 * mean_abs.max(1e-6),
+                "st {st}: max boundary jump {max_boundary} vs mean sample delta {mean_abs}"
+            );
+        }
     }
 
     /// Downward shifts work symmetrically (this is the direction that used
