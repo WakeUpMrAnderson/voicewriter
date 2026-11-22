@@ -251,6 +251,13 @@
           <div class="card">
             <div class="row"><label>Text-to-speech (Kokoro)</label></div>
             <div id="ttsModelList" class="voice-model-list"></div>
+            <div class="row" id="ttsEngineRow" hidden>
+              <label for="ttsEngine">Engine</label>
+              <select id="ttsEngine">
+                <option value="kokoro">Kokoro 82M (fast)</option>
+                <option value="phonon">Phonon 31M (voice alt)</option>
+              </select>
+            </div>
             <div class="row" id="ttsVoiceRow" hidden>
               <label for="ttsVoice">Voice</label>
               <select id="ttsVoice"></select>

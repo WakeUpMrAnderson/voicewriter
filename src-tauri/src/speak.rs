@@ -260,7 +260,8 @@ pub fn speak(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &str) -> Resu
             "Kokoro only supports English/Latin-script text — this selection isn't in a supported language"
         ));
     }
-    eprintln!("speak: synthesizing {} chars with Kokoro", text.trim().len());
+    let cfg = crate::settings::load(app);
+    eprintln!("speak: synthesizing {} chars with {}", text.trim().len(), if cfg.tts_engine == "phonon" { "Phonon" } else { "Kokoro" });
     speak_streaming(app, speaker, text)?;
     eprintln!("speak: done after {:?}", t0.elapsed());
     Ok(())

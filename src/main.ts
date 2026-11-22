@@ -19,6 +19,7 @@ interface Settings {
   polish: boolean;
   autostart: boolean;
   hideTray: boolean;
+  ttsEngine: string;
   ttsVoice: string;
   ttsSpeed: number;
   ttsVolume: number;
@@ -190,6 +191,7 @@ async function loadSettings() {
   polishChk.checked = settings.polish;
   autostartChk.checked = settings.autostart;
   hideTrayChk.checked = settings.hideTray;
+  ttsEngineSel.value = settings.ttsEngine || "kokoro";
   ttsSpeedInput.value = String(settings.ttsSpeed || 1.0);
   ttsSpeedVal.textContent = Number(ttsSpeedInput.value).toFixed(1) + "×";
   ttsVolumeInput.value = String(settings.ttsVolume ?? 1);
@@ -466,6 +468,8 @@ async function loadLoopbackDevices() {
 // ---- Voice Models (STT + TTS) ----
 const voiceModelsTotalSizeEl = $("voiceModelsTotalSize");
 const ttsModelListEl = $("ttsModelList");
+const ttsEngineRow = $("ttsEngineRow");
+const ttsEngineSel = $<HTMLSelectElement>("ttsEngine");
 const ttsVoiceRow = $("ttsVoiceRow");
 const ttsVoiceSel = $<HTMLSelectElement>("ttsVoice");
 const ttsSpeedRow = $("ttsSpeedRow");
@@ -558,7 +562,10 @@ async function refreshVoiceModels() {
 
     const ttsReady = tts.some((m) => m.present);
     ttsVoiceRow.hidden = !ttsReady;
-    ttsSpeedRow.hidden = !ttsReady;
+    ttsEngineRow.hidden = !ttsReady;
+    const phonon = (settings.ttsEngine || "kokoro") === "phonon";
+    ttsVoiceRow.hidden = !ttsReady || phonon;
+    ttsSpeedRow.hidden = !ttsReady || phonon;
     ttsVolumeRow.hidden = !ttsReady;
     ttsPreviewRow.hidden = !ttsReady;
 
@@ -584,6 +591,16 @@ async function loadTtsVoices() {
     console.error("list_tts_voices failed", e);
   }
 }
+
+ttsEngineSel.addEventListener("change", async () => {
+  save({ ttsEngine: ttsEngineSel.value });
+  // Warm the newly selected engine in the background so the next speak
+  // doesn't pay its cold load.
+  invoke("preload_tts_engine").catch(() => {});
+  const phonon = ttsEngineSel.value === "phonon";
+  ttsVoiceRow.hidden = phonon;
+  ttsSpeedRow.hidden = phonon;
+});
 
 ttsVoiceSel.addEventListener("change", () => save({ ttsVoice: ttsVoiceSel.value }));
 

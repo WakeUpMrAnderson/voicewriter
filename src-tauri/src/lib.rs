@@ -1048,6 +1048,13 @@ fn set_web_hotkey(app: AppHandle<Wry>, hotkey: String) -> bool {
     true
 }
 
+/// Warm the currently selected TTS engine in the background — invoked when
+/// the user switches engines in Settings, so the next speak is instant.
+#[tauri::command]
+fn preload_tts_engine(app: AppHandle<Wry>) {
+    kokoro::preload(app);
+}
+
 #[tauri::command]
 fn set_professional_hotkey(app: AppHandle<Wry>, hotkey: String) -> bool {
     if !apply_professional_shortcut(&app, &hotkey) {
@@ -2358,6 +2365,7 @@ pub fn run() {
             set_wheel_hotkey,
             set_web_hotkey,
             set_professional_hotkey,
+            preload_tts_engine,
             set_humanize_hotkey,
             wheel_run,
             wheel_cancel,
