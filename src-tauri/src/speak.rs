@@ -113,14 +113,16 @@ impl Speaker {
         Ok(gen)
     }
 
-    /// Start playing raw 24 kHz mono samples, replacing any current playback.
-    /// `volume` is a 0.0..1.0 multiplier on the output sink. More audio can
-    /// be queued onto the same playback with `append()`.
-    fn play_samples(&self, samples: Vec<f32>, volume: f32) -> Result<u64> {
+    /// Start playing raw mono samples at `sample_rate` (the engine's config
+    /// rate — 24 kHz for Kokoro/Phonon, Piper voices ship their own, see
+    /// `piper::sample_rate`), replacing any current playback. `volume` is a
+    /// 0.0..1.0 multiplier on the output sink. More audio can be queued onto
+    /// the same playback with `append()`.
+    fn play_samples(&self, samples: Vec<f32>, sample_rate: u32, volume: f32) -> Result<u64> {
         let (stream, handle): (OutputStream, OutputStreamHandle) =
             rodio::OutputStream::try_default().context("open audio output device")?;
         let sink = Sink::try_new(&handle).context("create audio sink")?;
-        sink.append(SamplesBuffer::new(1, crate::kokoro::SAMPLE_RATE, samples));
+        sink.append(SamplesBuffer::new(1, sample_rate, samples));
         sink.set_volume(volume.clamp(0.0, 1.0));
 
         let mut guard = self.active.lock();
@@ -132,12 +134,13 @@ impl Speaker {
         Ok(gen)
     }
 
-    /// Queue more samples after playback `gen`. Returns false if that
-    /// playback was stopped or replaced, so the caller can stop synthesizing.
-    fn append(&self, gen: u64, samples: Vec<f32>) -> bool {
+    /// Queue more samples after playback `gen`, at the same `sample_rate`
+    /// the playback was started with. Returns false if that playback was
+    /// stopped or replaced, so the caller can stop synthesizing.
+    fn append(&self, gen: u64, samples: Vec<f32>, sample_rate: u32) -> bool {
         match &*self.active.lock() {
             Some(p) if p.gen == gen => {
-                p.sink.append(SamplesBuffer::new(1, crate::kokoro::SAMPLE_RATE, samples));
+                p.sink.append(SamplesBuffer::new(1, sample_rate, samples));
                 true
             }
             _ => false,
@@ -248,33 +251,49 @@ impl Crossfader {
     }
 }
 
-/// Synthesize `text` locally with Kokoro and play it aloud. Blocks until
-/// playback finishes naturally or is stopped via `Speaker::stop`. Kokoro is
-/// English/Latin-script only — non-Latin text (e.g. Bangla) is rejected with
-/// a clear error rather than silently producing garbled audio, per the
-/// product decision to drop the eSpeak NG fallback for this feature.
+/// Synthesize `text` locally with the engine chosen in Settings and play it
+/// aloud. Blocks until playback finishes naturally or is stopped via
+/// `Speaker::stop`. Kokoro is English/Latin-script only — non-Latin text
+/// (e.g. Bangla) is rejected with a clear error rather than silently
+/// producing garbled audio, per the product decision to drop the eSpeak NG
+/// fallback for this feature; the Piper engine exists precisely for
+/// non-Latin text (Persian), so the guard doesn't apply there.
 pub fn speak(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &str) -> Result<()> {
     let t0 = std::time::Instant::now();
-    if crate::kokoro::needs_unsupported_language(text) {
+    let cfg = crate::settings::load(app);
+    if cfg.tts_engine != "piper" && crate::kokoro::needs_unsupported_language(text) {
         return Err(anyhow!(
             "Kokoro only supports English/Latin-script text — this selection isn't in a supported language"
         ));
     }
-    let cfg = crate::settings::load(app);
-    eprintln!("speak: synthesizing {} chars with {}", text.trim().len(), if cfg.tts_engine == "phonon" { "Phonon" } else { "Kokoro" });
+    eprintln!(
+        "speak: synthesizing {} chars with {}",
+        text.trim().len(),
+        match cfg.tts_engine.as_str() {
+            "phonon" => "Phonon",
+            "piper" => "Piper",
+            _ => "Kokoro",
+        }
+    );
     speak_streaming(app, speaker, text)?;
     eprintln!("speak: done after {:?}", t0.elapsed());
     Ok(())
 }
 
-/// Synthesize `text` with Kokoro sentence by sentence and play each chunk as
-/// soon as it's ready, so speech starts after the first sentence. Blocks
-/// until playback finishes or is stopped via `Speaker::stop`.
+/// Synthesize `text` with the selected engine sentence by sentence and play
+/// each chunk as soon as it's ready, so speech starts after the first
+/// sentence. Blocks until playback finishes or is stopped via
+/// `Speaker::stop`.
 pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &str) -> Result<()> {
     let t0 = std::time::Instant::now();
     let cfg = crate::settings::load(app);
     let mut gen: Option<u64> = None;
     let mut fader = Crossfader::new();
+    // Playback rate: Kokoro/Phonon output 24 kHz; Piper voices ship their
+    // own (Mana's config says 22050). The engine is built before the first
+    // chunk arrives, so the rate can be read from the loaded engine then.
+    let is_piper = cfg.tts_engine == "piper";
+    let mut sample_rate = crate::kokoro::SAMPLE_RATE;
     crate::kokoro::speak_chunks(
         app,
         text,
@@ -286,12 +305,15 @@ pub fn speak_streaming(app: &tauri::AppHandle, speaker: &Arc<Speaker>, text: &st
             fader.apply(&mut samples);
             match gen {
                 None => {
-                    gen = Some(speaker.play_samples(samples, cfg.tts_volume)?);
+                    if is_piper {
+                        sample_rate = crate::piper::sample_rate().unwrap_or(sample_rate);
+                    }
+                    gen = Some(speaker.play_samples(samples, sample_rate, cfg.tts_volume)?);
                     eprintln!("speak: first audio after {:?}", t0.elapsed());
                     crate::events::emit(app, crate::events::Status::Speaking, Some("playing…".into()));
                     Ok(true)
                 }
-                Some(g) => Ok(speaker.append(g, samples)),
+                Some(g) => Ok(speaker.append(g, samples, sample_rate)),
             }
         },
     )?;

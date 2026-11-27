@@ -414,6 +414,10 @@ pub fn preload(app: AppHandle<Wry>) {
             crate::phonon::preload(app);
             return;
         }
+        if crate::settings::load(&app).tts_engine == "piper" {
+            crate::piper::preload(app);
+            return;
+        }
         let Ok((model, voices)) = crate::model::kokoro_paths(&app) else { return };
         if !model.is_file() || !voices.is_file() {
             return;
@@ -472,6 +476,7 @@ pub fn speak_chunks(
     match engine.as_str() {
         "" | "kokoro" => kokoro_speak_chunks(app, text, voice, blend_voice, speed, on_chunk),
         "phonon" => crate::phonon::speak_chunks(app, text, voice, on_chunk),
+        "piper" => crate::piper::speak_chunks(app, text, voice, on_chunk),
         other => Err(anyhow!("unknown TTS engine '{other}' — pick one in Settings")),
     }
 }

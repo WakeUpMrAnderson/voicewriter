@@ -16,6 +16,7 @@ mod format;
 mod groq;
 mod kokoro;
 mod phonon;
+mod piper;
 #[cfg(windows)]
 mod hotkey_guard;
 mod keychain;
@@ -2044,13 +2045,15 @@ async fn download_voice_model(app: AppHandle<Wry>, model: String) -> Result<(), 
         .map_err(|e| e.to_string())
 }
 
-/// Delete a downloaded model's files. If it's the Kokoro model, also drops
-/// the in-memory loaded engine so a stale session isn't reused.
+/// Delete a downloaded model's files. If it's a TTS model, also drops that
+/// engine's in-memory session so a stale one isn't reused.
 #[tauri::command]
 fn delete_voice_model(app: AppHandle<Wry>, model: String) -> Result<(), String> {
     model::delete(&app, &model).map_err(|e| e.to_string())?;
     if model == "kokoro-82m" {
         kokoro::unload();
+    } else if model == "piper-fa-mana" {
+        piper::unload();
     }
     Ok(())
 }

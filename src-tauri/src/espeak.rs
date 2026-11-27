@@ -1,9 +1,12 @@
-//! Resolves the bundled eSpeak NG binary + data directory. The binary itself
-//! is used as a phonemizer for Kokoro TTS (`--ipa` mode — see `kokoro.rs`'s
-//! module doc comment for why), not as its own standalone TTS engine; the
-//! fallback TTS role this module used to serve (synthesizing non-Latin-script
-//! speech directly via eSpeak NG's own voice) was removed when Kokoro became
-//! the sole TTS engine.
+//! Resolves the bundled eSpeak NG binary + data directory, and (when the
+//! platform DLL can be loaded) calls it in-process so phonemizing a clause is
+//! a function call instead of starting `espeak-ng` (~0.4-1 s per process on
+//! Windows). The binary itself is the phonemizer fallback for Kokoro TTS
+//! (`--ipa` mode — see `kokoro.rs`'s module doc comment for why), while the
+//! in-process library also serves the Piper engine's Persian voice
+//! (`fa_phonemes` — see `piper.rs`); the fallback TTS role this module used
+//! to serve (synthesizing non-Latin-script speech directly via eSpeak NG's
+//! own voice) was removed when Kokoro became the sole TTS engine.
 
 use std::path::PathBuf;
 use tauri::{path::BaseDirectory, AppHandle, Manager, Wry};
@@ -58,7 +61,9 @@ fn vendor_dir() -> Option<PathBuf> {
 
 /// eSpeak NG loaded in-process, so phonemizing a clause is a function call
 /// instead of starting `espeak-ng` (~0.4-1 s per process on Windows).
-struct Lib {
+/// `pub(crate)` alongside `open_lib`/`lib_fa_phonemes` for `piper.rs`'s
+/// model smoke test.
+pub(crate) struct Lib {
     _lib: libloading::Library,
     set_voice: unsafe extern "C" fn(*const std::ffi::c_char) -> std::ffi::c_int,
     to_phonemes: unsafe extern "C" fn(
@@ -66,6 +71,19 @@ struct Lib {
         std::ffi::c_int,
         std::ffi::c_int,
     ) -> *const std::ffi::c_char,
+    /// `espeak_TextToPhonemesWithTerminator` (same signature as
+    /// `espeak_TextToPhonemes` plus a final `int *terminator` out-param,
+    /// added in espeak-ng 1.52). Resolved opportunistically — `None` on older
+    /// builds like the currently vendored one — because failing to load it
+    /// must not break the existing en-us phonemization path.
+    to_phonemes_with_terminator: Option<
+        unsafe extern "C" fn(
+            *mut *const std::ffi::c_void,
+            std::ffi::c_int,
+            std::ffi::c_int,
+            *mut std::ffi::c_int,
+        ) -> *const std::ffi::c_char,
+    >,
     voice: String,
 }
 
@@ -107,7 +125,14 @@ fn strip_verbatim(path: &str) -> String {
     path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
-fn open_lib(lib_path: &std::path::Path, data_parent: Option<&std::ffi::CString>) -> Result<Lib, String> {
+/// Load the eSpeak NG library and initialize it against `data_parent` (the
+/// directory *containing* espeak-ng-data, or `None` for the library's
+/// default). `pub(crate)` so `piper.rs`'s model smoke test can drive the
+/// same in-process path without an `AppHandle`.
+pub(crate) fn open_lib(
+    lib_path: &std::path::Path,
+    data_parent: Option<&std::ffi::CString>,
+) -> Result<Lib, String> {
     use std::ffi::{c_char, c_int};
     {
         // SAFETY: symbol signatures match espeak-ng's speak_lib.h.
@@ -123,7 +148,9 @@ fn open_lib(lib_path: &std::path::Path, data_parent: Option<&std::ffi::CString>)
             }
             let set_voice = *lib.get(b"espeak_SetVoiceByName").map_err(|e| e.to_string())?;
             let to_phonemes = *lib.get(b"espeak_TextToPhonemes").map_err(|e| e.to_string())?;
-            Ok(Lib { _lib: lib, set_voice, to_phonemes, voice: String::new() })
+            // Optional: only espeak-ng >= 1.52 exports the terminator variant.
+            let to_phonemes_with_terminator = lib.get(b"espeak_TextToPhonemesWithTerminator").ok().map(|s| *s);
+            Ok(Lib { _lib: lib, set_voice, to_phonemes, to_phonemes_with_terminator, voice: String::new() })
         }
     }
 }
@@ -136,20 +163,41 @@ pub(crate) fn ipa(app: &AppHandle<Wry>, text: &str, voice: &str) -> Option<Strin
 }
 
 fn lib_ipa(lib: &mut Lib, text: &str, voice: &str) -> Option<String> {
+    set_voice(lib, voice)?;
+    raw_phonemes(lib, text)
+}
+
+/// Point the shared library at `voice`, cached — `ipa` (en-us, for Kokoro)
+/// and `fa_phonemes` (fa, for Piper) share one library, so the voice is
+/// re-set through `espeak_SetVoiceByName` whenever the requested voice
+/// changes.
+fn set_voice(lib: &mut Lib, voice: &str) -> Option<()> {
+    use std::ffi::CString;
+    if lib.voice == voice {
+        return Some(());
+    }
+    let v = CString::new(voice).ok()?;
+    // SAFETY: `v` outlives the call; eSpeak NG copies the voice name.
+    if unsafe { (lib.set_voice)(v.as_ptr()) } != 0 {
+        return None;
+    }
+    lib.voice = voice.to_string();
+    Some(())
+}
+
+/// One `espeak_TextToPhonemes` pass over `text` (voice must already be set):
+/// eSpeak NG advances `ptr` through internal clause breaks until the text is
+/// consumed, so multi-clause input yields several IPA strings — joined with
+/// a space here, the same way `kokoro.rs` joins the CLI's line-per-clause
+/// output.
+fn raw_phonemes(lib: &mut Lib, text: &str) -> Option<String> {
     use std::ffi::{c_void, CStr, CString};
+    const CHARS_UTF8: i32 = 1;
+    const PHONEMES_IPA: i32 = 0x02;
     let text = CString::new(text).ok()?;
     // SAFETY: pointers are valid for the duration of each call; eSpeak NG
     // advances `ptr` through `text` and sets it to null when done.
     unsafe {
-        if lib.voice != voice {
-            let v = CString::new(voice).ok()?;
-            if (lib.set_voice)(v.as_ptr()) != 0 {
-                return None;
-            }
-            lib.voice = voice.to_string();
-        }
-        const CHARS_UTF8: i32 = 1;
-        const PHONEMES_IPA: i32 = 0x02;
         let mut parts = Vec::new();
         let mut ptr = text.as_ptr() as *const c_void;
         while !ptr.is_null() {
@@ -163,6 +211,124 @@ fn lib_ipa(lib: &mut Lib, text: &str, voice: &str) -> Option<String> {
             }
         }
         Some(parts.join(" "))
+    }
+}
+
+/// Per-clause `(IPA, terminator)` pairs for `text`, phonemized with eSpeak
+/// NG's `fa` voice — the phonemizer Piper's Persian voice was trained on
+/// (see `piper.rs`). Each IPA string is NFD-normalized before returning, so
+/// every codepoint is a key of Piper's `phoneme_id_map`.
+///
+/// The terminator encodes the clause-break punctuation eSpeak NG stripped
+/// from the IPA string: its low 16 bits are the punctuation character
+/// (0 = none) and bit 0x80000 marks a sentence end (espeak-ng's
+/// `CLAUSE_TYPE_SENTENCE`, as in `CLAUSE_PERIOD = 0x80000 + '.'`).
+/// `None` if the library couldn't be loaded.
+pub(crate) fn fa_phonemes(app: &AppHandle<Wry>, text: &str) -> Option<Vec<(String, i32)>> {
+    let lib = LIB.get_or_init(|| load_lib(app)).as_ref()?;
+    lib_fa_phonemes(&mut lib.lock(), text)
+}
+
+/// The locked inner half of `fa_phonemes` — `pub(crate)` so `piper.rs`'s
+/// model smoke test can phonemize through a directly-`open_lib`'d library
+/// without an `AppHandle`.
+pub(crate) fn lib_fa_phonemes(lib: &mut Lib, text: &str) -> Option<Vec<(String, i32)>> {
+    use std::ffi::{c_int, c_void, CStr, CString};
+    use unicode_normalization::UnicodeNormalization;
+    const CHARS_UTF8: i32 = 1;
+    const PHONEMES_IPA: i32 = 0x02;
+    set_voice(lib, "fa")?;
+    match lib.to_phonemes_with_terminator {
+        Some(to_phonemes_with_terminator) => {
+            let text = CString::new(text).ok()?;
+            // SAFETY: pointers are valid for the duration of each call;
+            // eSpeak NG advances `ptr` through `text` and sets it to null
+            // when done, writing each clause's break info into `terminator`.
+            let mut clauses = Vec::new();
+            unsafe {
+                let mut ptr = text.as_ptr() as *const c_void;
+                while !ptr.is_null() {
+                    let mut terminator: c_int = 0;
+                    let out = to_phonemes_with_terminator(&mut ptr, CHARS_UTF8, PHONEMES_IPA, &mut terminator);
+                    if out.is_null() {
+                        break;
+                    }
+                    let ipa = CStr::from_ptr(out).to_string_lossy().trim().nfd().collect::<String>();
+                    // Punctuation-only clauses are kept: their terminator
+                    // still carries a mark Piper must re-append.
+                    if !ipa.is_empty() || terminator & 0xFFFF != 0 {
+                        clauses.push((ipa, terminator));
+                    }
+                }
+            }
+            Some(clauses)
+        }
+        None => {
+            // The vendored espeak-ng build predates
+            // `espeak_TextToPhonemesWithTerminator` (espeak-ng 1.52), so
+            // split the text into clauses ourselves and emulate the
+            // terminator values eSpeak NG would report — the id-stream
+            // semantics `piper.rs` sees stay identical either way.
+            let mut clauses = Vec::new();
+            for (piece, punct) in split_clauses(text) {
+                let ipa = raw_phonemes(lib, &piece)?;
+                clauses.push((ipa.nfd().collect::<String>(), emulated_terminator(punct)));
+            }
+            Some(clauses)
+        }
+    }
+}
+
+/// The clause-break punctuation eSpeak NG splits clauses at, including the
+/// Arabic-script comma/semicolon/question mark Persian text uses.
+const CLAUSE_PUNCT: &[char] = &['.', '!', '?', ',', ';', ':', '،', '؛', '؟'];
+
+/// Split `text` into `(clause, boundary punctuation)` pieces on eSpeak NG's
+/// clause breaks; the final piece's punctuation is `None` (end of text).
+/// Decimal/number separators ("3.14", "1,000") are not treated as breaks,
+/// mirroring eSpeak NG's own handling.
+fn split_clauses(text: &str) -> Vec<(String, Option<char>)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(String, Option<char>)> = Vec::new();
+    let mut current = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let is_number_sep = (c == '.' || c == ',')
+            && chars[..i].last().is_some_and(|p| p.is_numeric())
+            && chars.get(i + 1).is_some_and(|n| n.is_numeric());
+        if CLAUSE_PUNCT.contains(&c) && !is_number_sep {
+            if !current.trim().is_empty() {
+                out.push((std::mem::take(&mut current).trim().to_string(), Some(c)));
+            } else if let Some(last) = out.last_mut() {
+                // A punctuation run ("?!") — keep only the strongest mark.
+                last.1 = Some(c);
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push((std::mem::take(&mut current).trim().to_string(), None));
+    }
+    out
+}
+
+/// The terminator value eSpeak NG would report for a clause broken by
+/// `punct` (`None` = end of text, which eSpeak NG treats as a period).
+/// Arabic-script marks map to their Latin equivalents — those are what
+/// eSpeak NG reports, and what Piper's id map carries (the Arabic variants
+/// aren't keys in it).
+fn emulated_terminator(punct: Option<char>) -> i32 {
+    const SENTENCE_END: i32 = 0x80000;
+    let c = match punct {
+        None => return SENTENCE_END | ('.' as i32),
+        Some('،') => ',',
+        Some('؛') => ';',
+        Some('؟') => '?',
+        Some(c) => c,
+    };
+    match c {
+        '.' | '!' | '?' => SENTENCE_END | (c as i32),
+        _ => c as i32,
     }
 }
 
@@ -188,5 +354,60 @@ mod tests {
             let from_cli = String::from_utf8_lossy(&out.stdout).lines().collect::<Vec<_>>().join(" ");
             assert_eq!(from_lib, from_cli.trim(), "[{text}]");
         }
+    }
+}
+
+#[cfg(test)]
+mod clause_tests {
+    use super::*;
+
+    #[test]
+    fn split_clauses_splits_on_clause_punctuation() {
+        // Each clause carries the punctuation that closed it; only a final
+        // piece with no punctuation at all gets `None`.
+        let clauses = split_clauses("سلام، حالت خوب؟");
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0], ("سلام".to_string(), Some('،')));
+        assert_eq!(clauses[1], ("حالت خوب".to_string(), Some('؟')));
+        // No punctuation at all: one clause, end of text.
+        assert_eq!(split_clauses("سلام"), vec![("سلام".to_string(), None)]);
+        assert_eq!(split_clauses("سلام. حالت خوب"), vec![
+            ("سلام".to_string(), Some('.')),
+            ("حالت خوب".to_string(), None)
+        ]);
+    }
+
+    #[test]
+    fn split_clauses_collapses_punctuation_runs_and_skips_empty() {
+        // "؟!" is a run: only the strongest mark survives, no empty clause.
+        let clauses = split_clauses("سلام؟!");
+        assert_eq!(clauses, vec![("سلام".to_string(), Some('!'))]);
+        // Leading punctuation with no preceding clause is dropped.
+        assert_eq!(split_clauses("،سلام"), vec![("سلام".to_string(), None)]);
+    }
+
+    #[test]
+    fn split_clauses_keeps_number_separators() {
+        assert_eq!(split_clauses("3.14 و 1,000"), vec![("3.14 و 1,000".to_string(), None)]);
+        // A sentence-ending period after a number still splits.
+        let clauses = split_clauses("42. سال");
+        assert_eq!(clauses, vec![("42".to_string(), Some('.')), ("سال".to_string(), None)]);
+    }
+
+    #[test]
+    fn emulated_terminator_matches_espeak_clause_codes() {
+        // espeak-ng: CLAUSE_PERIOD = CLAUSE_TYPE_SENTENCE + '.', clause marks
+        // carry no sentence bit.
+        const SENTENCE_END: i32 = 0x80000;
+        assert_eq!(emulated_terminator(Some('.')), SENTENCE_END | ('.' as i32));
+        assert_eq!(emulated_terminator(Some('!')), SENTENCE_END | ('!' as i32));
+        assert_eq!(emulated_terminator(Some(',')), ',' as i32);
+        assert_eq!(emulated_terminator(Some(':')), ':' as i32);
+        assert_eq!(emulated_terminator(None), SENTENCE_END | ('.' as i32));
+        // Arabic-script marks map to their Latin equivalents (which are what
+        // Piper's phoneme_id_map carries).
+        assert_eq!(emulated_terminator(Some('؟')), SENTENCE_END | ('?' as i32));
+        assert_eq!(emulated_terminator(Some('،')), ',' as i32);
+        assert_eq!(emulated_terminator(Some('؛')), ';' as i32);
     }
 }

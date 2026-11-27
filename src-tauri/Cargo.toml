@@ -65,6 +65,10 @@ misaki-rs = { version = "0.11", default-features = false }
 # Models), so the hf/hub download features stay off.
 ptts = { version = "0.7", features = ["hf"] }
 
+# NFD-decomposes espeak-ng's IPA output for the Piper engine (each NFD
+# codepoint is one key of the model config's phoneme_id_map — see piper.rs).
+unicode-normalization = "0.1"
+
 # Groq API upload (multipart) + model download
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",

@@ -1,6 +1,6 @@
 //! Voice model management: the catalogue of downloadable local
-//! text-to-speech (Kokoro) models, their on-disk state, and download with
-//! progress events for the Settings → Voice Models UI.
+//! text-to-speech models (Kokoro, Phonon, Piper), their on-disk state, and
+//! download with progress events for the Settings → Voice Models UI.
 //!
 //! Models live in the OS app-data dir (see `tauri.conf.json` -> `identifier`),
 //! under a `models/` subfolder. The TTS model is two files (the ONNX weights, and a separate voices pack)
@@ -94,6 +94,28 @@ const MODELS: &[Known] = &[
             },
         ],
     },
+    // Persian voice for the Piper engine (see `piper.rs`): a standard
+    // piper-v1 espeak-voice model, whose .onnx.json sidecar carries the
+    // phoneme_id_map, sample rate and inference scales.
+    Known {
+        id: "piper-fa-mana",
+        kind: Kind::Tts,
+        label: "Piper Persian (Mana)",
+        files: &[
+            KnownFile {
+                part: "model",
+                url: "https://huggingface.co/MahtaFetrat/Mana-Persian-Piper/resolve/main/fa_IR-mana-medium.onnx",
+                file_name: "piper-fa-mana.onnx",
+                approx_bytes: 63_531_379,
+            },
+            KnownFile {
+                part: "config",
+                url: "https://huggingface.co/MahtaFetrat/Mana-Persian-Piper/resolve/main/fa_IR-mana-medium.onnx.json",
+                file_name: "piper-fa-mana.onnx.json",
+                approx_bytes: 7_088,
+            },
+        ],
+    },
 ];
 
 /// Paths to Phonon's four files — (config, weights, voice, tokenizer), in
@@ -104,6 +126,16 @@ pub fn phonon_paths(app: &AppHandle<Wry>) -> Result<(PathBuf, PathBuf, PathBuf, 
         file_path(app, "phonon-31m-en", "model")?,
         file_path(app, "phonon-31m-en", "voice")?,
         file_path(app, "phonon-31m-en", "tokenizer")?,
+    ))
+}
+
+/// Paths to Piper's ONNX weights and its JSON config (which carries the
+/// phoneme id map, sample rate and inference scales), in that order. Used by
+/// `piper.rs`.
+pub fn piper_paths(app: &AppHandle<Wry>) -> Result<(PathBuf, PathBuf)> {
+    Ok((
+        file_path(app, "piper-fa-mana", "model")?,
+        file_path(app, "piper-fa-mana", "config")?,
     ))
 }
 
