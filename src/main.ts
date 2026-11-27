@@ -192,6 +192,7 @@ async function loadSettings() {
   autostartChk.checked = settings.autostart;
   hideTrayChk.checked = settings.hideTray;
   ttsEngineSel.value = settings.ttsEngine || "kokoro";
+  applyTtsVisibility();
   ttsSpeedInput.value = String(settings.ttsSpeed || 1.0);
   ttsSpeedVal.textContent = Number(ttsSpeedInput.value).toFixed(1) + "×";
   ttsVolumeInput.value = String(settings.ttsVolume ?? 1);
@@ -470,6 +471,16 @@ const voiceModelsTotalSizeEl = $("voiceModelsTotalSize");
 const ttsModelListEl = $("ttsModelList");
 const ttsEngineRow = $("ttsEngineRow");
 const ttsEngineSel = $<HTMLSelectElement>("ttsEngine");
+let ttsReady = false;
+
+/// Voice / Speed belong to Kokoro only — Phonon 31M ships a single voice and
+/// ignores speed. Applied from every load/order path (models resolve and
+/// settings populate at different times; the loser must not re-show rows).
+function applyTtsVisibility() {
+  const phonon = (ttsEngineSel.value || settings.ttsEngine || "kokoro") === "phonon";
+  ttsVoiceRow.hidden = !ttsReady || phonon;
+  ttsSpeedRow.hidden = !ttsReady || phonon;
+}
 const ttsVoiceRow = $("ttsVoiceRow");
 const ttsVoiceSel = $<HTMLSelectElement>("ttsVoice");
 const ttsSpeedRow = $("ttsSpeedRow");
@@ -560,12 +571,9 @@ async function refreshVoiceModels() {
 
     ttsModelListEl.replaceChildren(...tts.map(renderModelRow));
 
-    const ttsReady = tts.some((m) => m.present);
-    ttsVoiceRow.hidden = !ttsReady;
+    ttsReady = tts.some((m) => m.present);
     ttsEngineRow.hidden = !ttsReady;
-    const phonon = (settings.ttsEngine || "kokoro") === "phonon";
-    ttsVoiceRow.hidden = !ttsReady || phonon;
-    ttsSpeedRow.hidden = !ttsReady || phonon;
+    applyTtsVisibility();
     ttsVolumeRow.hidden = !ttsReady;
     ttsPreviewRow.hidden = !ttsReady;
 
@@ -597,9 +605,7 @@ ttsEngineSel.addEventListener("change", async () => {
   // Warm the newly selected engine in the background so the next speak
   // doesn't pay its cold load.
   invoke("preload_tts_engine").catch(() => {});
-  const phonon = ttsEngineSel.value === "phonon";
-  ttsVoiceRow.hidden = phonon;
-  ttsSpeedRow.hidden = phonon;
+  applyTtsVisibility();
 });
 
 ttsVoiceSel.addEventListener("change", () => save({ ttsVoice: ttsVoiceSel.value }));
