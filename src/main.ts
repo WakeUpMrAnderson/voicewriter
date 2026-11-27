@@ -477,9 +477,11 @@ let ttsReady = false;
 /// ignores speed. Applied from every load/order path (models resolve and
 /// settings populate at different times; the loser must not re-show rows).
 function applyTtsVisibility() {
-  const phonon = (ttsEngineSel.value || settings.ttsEngine || "kokoro") === "phonon";
-  ttsVoiceRow.hidden = !ttsReady || phonon;
-  ttsSpeedRow.hidden = !ttsReady || phonon;
+  const engine = ttsEngineSel.value || settings.ttsEngine || "kokoro";
+  // Piper (Persian Mana) is also single-voice and speed-less — hide both.
+  const hideVoiceSpeed = engine === "phonon" || engine === "piper";
+  ttsVoiceRow.hidden = !ttsReady || hideVoiceSpeed;
+  ttsSpeedRow.hidden = !ttsReady || hideVoiceSpeed;
 }
 const ttsVoiceRow = $("ttsVoiceRow");
 const ttsVoiceSel = $<HTMLSelectElement>("ttsVoice");
